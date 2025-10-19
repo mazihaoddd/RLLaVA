@@ -1,23 +1,23 @@
 <div align="center">
-  <img src="assets/icon.png" alt="RLLaVA Factory Icon" width="200">
+  <img src="assets/icon.png" alt="RLLaVA Icon" width="200">
 </div>
 
-# RLLaVA Factory: A Modular Framework for Multimodal Reinforcement Learning 🚀
+# RLLaVA: a RL-central Framework for Language and Vision Assistant 🚀
 
 > **Algorithm-Driven Design • Native Multimodal Support • Production-Ready Training**
 
-## 💡 What is RLLaVA Factory?
+## 💡 What is RLLaVA?
 
-RLLaVA Factory is a **flexible, production-ready framework** for applying reinforcement learning to vision-language models.
+RLLaVA is a **flexible, production-ready framework** for applying reinforcement learning to vision-language models.
 
-**Key Innovation:** Unlike traditional frameworks that intertwine algorithm logic with distributed system details, RLLaVA Factory's **algorithm-driven architecture** lets you focus on RL research—not system engineering.
+**Key Innovation:** Unlike traditional frameworks that intertwine algorithm logic with distributed system details, RLLaVA's **algorithm-driven architecture** lets you focus on RL research—not system engineering.
 
 **Built for:** Researchers who want to experiment with diverse RL algorithms (GRPO, PPO, REMAX, etc.) on multimodal tasks—from math reasoning to agentic applications—without rewriting training infrastructure.
 
-Built upon TinyLLaVA's design philosophy of lightweight and extensible architecture, RLLaVA Factory provides a powerful yet accessible platform for multimodal RL development.
+Built upon TinyLLaVA's design philosophy of lightweight and extensible architecture, RLLaVA provides a powerful yet accessible platform for multimodal RL development.
 
 <div align="center">
-  <img src="assets/arch.png" alt="RLLaVA Factory Architecture" width="600">
+  <img src="assets/arch.png" alt="RLLaVA  Architecture" width="600">
 </div>
 
 ---
@@ -54,7 +54,7 @@ conda create -n rllava python==3.11 && conda activate rllava
 
 ## 🏗️ How It Works
 
-RLLaVA Factory simplifies RL training into **3 steps**:
+RLLaVA simplifies RL training into **3 steps**:
 
 **Step 1: Define your task** (reward function + prompt template)
 ```python
