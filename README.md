@@ -2,7 +2,7 @@
   <img src="assets/icon.png" alt="RLLaVA Icon" width="200">
 </div>
 
-# RLLaVA: a RL-central Framework for Language and Vision Assistant 🚀
+# RLLaVA: A RL-central Framework for Language and Vision Assistant 🚀
 
 > **Algorithm-Driven Design • Native Multimodal Support • Production-Ready Training**
 
@@ -48,7 +48,7 @@ git clone https://github.com/TinyLoopX/RLLaVA && cd RLLaVA
 
 conda create -n rllava python==3.11 && conda activate rllava
 
-./install.sh
+bash ./install.sh
 ```
 
 

@@ -177,8 +177,8 @@ class FSDPAccelerator(TrainEngine):
         self._optimizers: list[Optimizer] = []
         self._lr_schedulers: list[LRScheduler] = []
         self._state_filename = "fsdp_engine_state.pt"
-        self._offload_param = getattr(getattr(config, "offload", None), "offload_params", False)
-        self._offload_optimizer = getattr(getattr(config, "offload", None), "offload_optimizer", False)
+        self._offload_param = getattr(self.fsdp_config, "offload_params", False)
+        self._offload_optimizer = getattr(self.fsdp_config, "offload_optimizer", False)
         self._offload_gradients = self._offload_param and getattr(self.fsdp_config, "enable_cpu_offload", False)
         self._offload_managers: list[_FSDPOffloadManager] = []
         

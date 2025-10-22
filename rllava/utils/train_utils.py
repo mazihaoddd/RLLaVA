@@ -2,9 +2,7 @@ import logging
 import os
 
 import torch
-from peft.tuners.lora import LoraLayer
-from deepspeed import zero
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
 
 
 def make_inputs_require_grad(module, input, output):
@@ -12,6 +10,8 @@ def make_inputs_require_grad(module, input, output):
 
 
 def lora_kbit_setting(model, training_args):
+    from peft.tuners.lora import LoraLayer
+
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
             if training_args.bf16:
@@ -26,6 +26,9 @@ def lora_kbit_setting(model, training_args):
         
         
 def maybe_zero_3(param, ignore_status=False, name=None):
+    from deepspeed import zero
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
     if hasattr(param, "ds_id"):
         if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
             if not ignore_status:

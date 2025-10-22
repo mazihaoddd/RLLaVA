@@ -99,7 +99,7 @@ class HFAccelerator(TrainEngine):
             }
             deepspeed_plugin = DeepSpeedPlugin(
                 hf_ds_config=deepspeed_config,
-                zero3_init_flag=config.deepspeed.enable_rank0_init,
+                zero3_init_flag=True,
             )
             self.accelerator = Accelerator(
                 deepspeed_plugin=deepspeed_plugin

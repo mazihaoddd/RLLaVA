@@ -6,12 +6,10 @@
 @LastEditors: jiajunlong
 '''
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import time
 from threading import Thread
-import logging
 
 import gradio as gr
 import torch

@@ -66,7 +66,7 @@ class Rollout():
     def generate_one_batch(self, data: DataProto, filter: Callable = lambda sample: sample, val=False) -> DataProto:  
         # pop keys for generation
         gen_batch = data.pop(
-            batch_keys=["input_ids", "attention_mask", "position_ids"],
+            batch_keys=["input_ids", "attention_mask", "position_ids", "pixel_values", "image_grid_thw"],
             non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
             meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
         )

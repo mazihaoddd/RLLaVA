@@ -3,11 +3,12 @@ import psutil
 import numpy as np
 import logging
 import os
-import torch.distributed as dist
+
 from typing import Dict
 import torch.nn.functional as F
 from trl import get_peft_config
 from peft import get_peft_model
+from deprecated import deprecated
 from ..config import ActorConfig
 from rllava.data.protocol import DataProto
 from rllava.utils.device import get_torch_device
@@ -30,6 +31,7 @@ from rllava.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic
 from rllava.utils.device import get_device_name
 from rllava.engine import TrainEngine
 from rllava.utils.train_utils import find_all_linear_names
+from rllava.utils.dist_utils import is_rank0
 from contextlib import nullcontext
 
 try:
@@ -79,7 +81,8 @@ class Actor():
             model_class = AutoModelForCausalLM
         
         # Initialize model directly in Actor class
-        self._init_model_and_optimizer(model_class, model_config)
+        self.init_model(model_class, model_config)
+        self.init_optimizer()
         self.flops_counter = FlopsCounter(model_config)
 
     def unwrap_model(self):
@@ -101,6 +104,101 @@ class Actor():
             self.accelerator.save_state(checkpoint_path)
         self.accelerator.wait_for_everyone()
 
+    def init_model(self, model_class, model_config):
+        """Initialize model in Actor class."""
+        print_rank0("Initializing model in Actor class...")
+
+        # Load model
+        torch_dtype = self.config.model.torch_dtype
+        if torch_dtype is None:
+            torch_dtype = torch.float32
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        init_weight = self.accelerator.get_init_weight_context(use_meta_tensor=not self.config.model.tie_word_embeddings)
+        with init_weight():
+            self.model = model_class.from_pretrained(
+                self.config.model.model_path,
+                config=model_config,
+                torch_dtype=torch_dtype,
+                attn_implementation=self.config.model.attn_implementation,
+                trust_remote_code=self.config.model.trust_remote_code,
+            )
+        if self.config.model.enable_gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        self.config.model.lora_target_modules = find_all_linear_names(self.model, ['visual','connector', 'vision_tower'] )
+        peft_config = get_peft_config(self.config.model)
+
+        if peft_config is not None:
+            self.is_peft_model = True
+            self.model.enable_input_require_grads()
+            # If PEFT is used, wrap the model with PEFT
+            peft_model = get_peft_model(self.model, peft_config)
+            self.model = peft_model
+
+        if is_rank0() == 0:
+            print_model_size(self.model)
+        log_gpu_memory_usage(f"After init Actor from HF AutoModel", logger=logger)
+        self.model = self.accelerator.prepare(self.model)
+        log_gpu_memory_usage(f"After Actor Accelerator prepare", logger=logger)
+
+        # Handle reference model if needed
+        if self.config.use_kl_loss or self.config.use_kl_in_reward:
+            if peft_config is not None:
+                # If PEFT is used, disable adapters for reference
+                ref_model = self.model.disable_adapter()
+                self.ref_model = ref_model
+            else:
+                # Load separate reference model
+                with init_weight():
+                    self.ref_model = model_class.from_pretrained(
+                        self.config.model.model_path,
+                        config=self.config.model,
+                        torch_dtype=torch.bfloat16,
+                        attn_implementation=self.config.model.attn_implementation,
+                        trust_remote_code=self.config.model.trust_remote_code,
+                    )
+                for param in self.ref_model.parameters():
+                    param.requires_grad = False
+
+            log_gpu_memory_usage(f"After init Ref from HF AutoModel", logger=logger)
+            self.ref_model = self.accelerator.prepare(self.ref_model)
+            log_gpu_memory_usage(f"After Ref Accelerator prepare", logger=logger)
+
+    def init_optimizer(self):
+        # Create optimizer
+        if self.config.optim.strategy == "adamw":
+            self.optimizer = torch.optim.AdamW(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=self.config.optim.lr,
+                betas=self.config.optim.betas,
+                weight_decay=self.config.optim.weight_decay,
+                fused=True,
+            )
+        elif self.config.optim.strategy == "adamw_bf16":
+            from utils.torch_functional import AnyPrecisionAdamW
+            self.optimizer = AnyPrecisionAdamW(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=self.config.optim.lr,
+                betas=self.config.optim.betas,
+                weight_decay=self.config.optim.weight_decay,
+            )
+        else:
+            raise NotImplementedError(f"Optimizer {self.config.optim.strategy} not supported.")
+
+        # Create learning rate scheduler
+        if self.config.optim.lr_warmup_steps is not None:
+            num_warmup_steps = self.config.optim.lr_warmup_steps
+        else:
+            num_warmup_steps = int(self.config.optim.lr_warmup_ratio * self.config.optim.training_steps)
+
+        self.lr_scheduler = get_constant_schedule_with_warmup(
+            optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
+        )
+        self.optimizer, self.lr_scheduler = self.accelerator.prepare(self.optimizer, self.lr_scheduler)
+        log_gpu_memory_usage(f"After Optimizer and LR Scheduler Accelerator prepare", logger=logger)
+
+    @deprecated("Use init_model and init_optimizer instead")
     def _init_model_and_optimizer(self, model_class, model_config):
         """Initialize model and optimizer directly in Actor class."""
         print_rank0("Initializing model and optimizer in Actor class...")
@@ -133,7 +231,7 @@ class Actor():
             peft_model = get_peft_model(self.model, peft_config)
             self.model = peft_model
 
-        if dist.get_rank() == 0:
+        if is_rank0() == 0:
             print_model_size(self.model)
         log_gpu_memory_usage(f"After init Actor from HF AutoModel", logger=logger)
         self.model = self.accelerator.prepare(self.model)

@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, Optional
 from dataclasses import asdict, dataclass, field
-from rllava.utils.config import BaseConfig, ModelConfig, OptimConfig, FSDPConfig, DeepSpeedConfig, OffloadConfig
+from rllava.utils.config import BaseConfig, ModelConfig, OptimConfig, FSDPConfig, DeepSpeedConfig
 from rllava.engine import VLLMConfig, SGLangConfig
     
 
@@ -91,7 +91,6 @@ class CriticConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-    offload: OffloadConfig = field(default_factory=OffloadConfig)
     # below are auto keys
     global_batch_size_per_device: int = field(default=-1, init=False)
 
@@ -157,7 +156,6 @@ class ActorConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-    offload: OffloadConfig = field(default_factory=OffloadConfig)
     global_batch_size_per_device: int = field(default=-1, init=False)
     use_kl_loss: bool = True
     use_kl_in_reward: bool = False
@@ -170,7 +168,6 @@ class RefConfig:
     strategy: str = "fsdp"
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-    offload: OffloadConfig = field(default_factory=OffloadConfig)
     # below are auto keys
     log_prob_micro_batch_size_per_gpu: int = field(default=-1, init=False)
     padding_free: bool = field(default=False, init=False)

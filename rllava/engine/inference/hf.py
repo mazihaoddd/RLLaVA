@@ -61,17 +61,24 @@ class HFEngine(InferenceEngine):
         )
 
         self.model.eval()
-        
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                generation_config=self.generation_config,
-                output_scores=False,  # this is potentially very large
-                return_dict_in_generate=True,
-                use_cache=True,
-            )
+            # Prepare generation arguments based on task type
+            prompt_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "output_scores": False,  # this is potentially very large
+                "return_dict_in_generate": True,
+                "use_cache": True,
+            }
+            # Check if this is a multimodal task by checking for image-related fields
+            is_multimodal = "pixel_values" in prompts.batch and "image_grid_thw" in prompts.batch
+            if is_multimodal:
+                prompt_inputs["pixel_values"] = prompts.batch["pixel_values"]
+                prompt_inputs["image_grid_thw"] = prompts.batch["image_grid_thw"]
+
+            output = self.model.generate(**prompt_inputs, generation_config=self.generation_config)
         seq = output.sequences
         generated_batch_size = seq.size(0)  # bs * num_return_sequences
 
@@ -124,30 +131,12 @@ class HFEngine(InferenceEngine):
         torch.cuda.empty_cache()
         self.model.train()
 
-        # batch = TensorDict(
-        #     {
-        #         "prompts": input_ids,
-        #         "responses": response_ids,
-        #         "input_ids": sequence_ids,  # here input_ids become the whole sentences
-        #         "attention_mask": attention_mask,
-        #         "response_mask": response_mask,
-        #         "position_ids": position_ids,
-        #     },
-        #     batch_size=batch_size,
-        # )
-        # if batch_multi_modal_data is not None:
-        #     non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
-        # else:
-        #     non_tensor_batch = {}
-
-        # return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
-
         return DataProto(batch=batch)
 
     def generate(self, prompts: DataProto) -> DataProto:
         prompts = prompts.to(torch.cuda.current_device())
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = min(batch_size, max(batch_size // getattr(self.config, "micro_batch_size", batch_size), 1))
+        num_chunks = max(batch_size // getattr(self.config, "micro_batch_size", batch_size), 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
         
         # Add progress bar for batch processing

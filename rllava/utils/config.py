@@ -204,18 +204,13 @@ class OptimConfig:
 
 
 @dataclass
-class OffloadConfig:
-    offload_params: bool = False
-    offload_optimizer: bool = False
-
-
-@dataclass
 class FSDPConfig:
     enable_full_shard: bool = True
     enable_cpu_offload: bool = False
-    enable_rank0_init: bool = True
     use_orig_params: bool = False
     torch_dtype: Optional[str] = None
+    offload_params: bool = False
+    offload_optimizer: bool = False
     fsdp_size: int = -1
     ulysses_size: int = 1
     mp_param_dtype: str = "bf16"
@@ -228,14 +223,8 @@ class DeepSpeedConfig:
     zero_stage: int = 3
     enable_full_shard: bool = True
     enable_cpu_offload: bool = False
-    enable_rank0_init: bool = True
     use_orig_params: bool = False
     torch_dtype: Optional[str] = None
-
-@dataclass
-class OffloadConfig:
-    offload_params: bool = False
-    offload_optimizer: bool = False
 
 
 @dataclass
