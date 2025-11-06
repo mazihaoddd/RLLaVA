@@ -69,9 +69,9 @@ class CriticConfig:
     strategy: str = "fsdp"
     ppo_mini_batch_size: int = 256
     """number of samples per minibatch for updating critic"""
-    ppo_micro_batch_size_per_gpu: int = 4
+    ppo_micro_batch_size: int = 4
     """number of samples per forward pass for updating critic"""
-    log_prob_micro_batch_size_per_gpu: int = 16
+    log_prob_micro_batch_size: int = 16
     """number of samples per forward pass for computing values"""
     max_grad_norm: float = 1.0
     """number to clip grad norm"""
@@ -91,8 +91,6 @@ class CriticConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-    # below are auto keys
-    global_batch_size_per_device: int = field(default=-1, init=False)
 
 
 @dataclass
@@ -123,9 +121,9 @@ class ActorConfig:
     strategy: str = "fsdp"
     ppo_mini_batch_size: int = 256
     """number of samples per minibatch for updating actor"""
-    ppo_micro_batch_size_per_gpu: int = 4
+    ppo_micro_batch_size: int = 4
     """number of samples per forward pass for updating actor"""
-    log_prob_micro_batch_size_per_gpu: int = 16
+    log_prob_micro_batch_size: int = 16
     """number of samples per forward pass for computing log probs"""
     max_grad_norm: float = 1.0
     """number to clip grad norm"""
@@ -157,7 +155,6 @@ class ActorConfig:
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-    global_batch_size_per_device: int = field(default=-1, init=False)
     kl_loss_coef: float = 0.01
     kl_loss_type: str = "low_var_kl"
 

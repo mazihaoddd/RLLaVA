@@ -255,6 +255,9 @@ install_basic_deps() {
     
     # Basic packages (no compilation required)
     basic_packages=(
+        "sentence-transformers==4.1.0"
+        "math-verify==0.7.0"
+        "einops-exts==0.0.4"
         "deprecated==1.2.18"
         "torch==2.6.0"
         "torchvision==0.21.0" 

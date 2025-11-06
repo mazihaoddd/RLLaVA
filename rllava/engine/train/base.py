@@ -61,9 +61,6 @@ class TrainEngine:
     
     def clip_grad_norm_(self, model, max_norm):
         raise NotImplementedError("clip_grad_norm_ is not implemented")
-    
-    def get_model_weights(self, model=None):
-        raise NotImplementedError("get_model_weights is not implemented")
 
     @contextmanager
     def eval(self, model):

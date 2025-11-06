@@ -271,27 +271,6 @@ class FSDPAccelerator(TrainEngine):
         
         return grad_norm
 
-    def get_model_weights(self, model=None):
-        """Iterate over ``(name, tensor)`` pairs of CPU tensors.
-
-        The iterator is compatible with the streaming logic used by inference
-        engines—downstream consumers can iterate once and ship the tensors
-        without loading the entire state dict into memory.
-        """
-        target_model = model or (self.wrapped_models[0] if self.wrapped_models else None)
-        if target_model is None:
-            raise RuntimeError("No model available to extract weights from. Call prepare(model) first or pass a model.")
-
-        def _state_dict():
-            # Simply gather the model state and yield
-            # FSDP will handle parameter gathering internally
-            state_dict = self._gather_model_state(target_model)
-            
-            for name, tensor in state_dict.items():
-                yield name, tensor
-
-        return _state_dict()
-
     def _prepare_item(self, obj: Any, **kwargs: Any):
         if isinstance(obj, nn.Module):
             return self._prepare_module(obj, **kwargs)
@@ -384,42 +363,6 @@ class FSDPAccelerator(TrainEngine):
     def _register_lr_scheduler(self, scheduler: LRScheduler, **kwargs: Any) -> None:
         if scheduler not in self.lr_schedulers:
             self.lr_schedulers.append(scheduler)
-
-    def _default_device(self) -> torch.device:
-        if torch.cuda.is_available():
-            return torch.device("cuda", torch.cuda.current_device())
-        return torch.device("cpu")
-
-    def _ensure_tensor(self, value: Any) -> torch.Tensor:
-        if isinstance(value, torch.Tensor):
-            return value.to(self._default_device())
-        return torch.tensor(value, device=self._default_device())
-
-    def _gather_model_state(self, module: nn.Module) -> Dict[str, torch.Tensor]:
-        """Gather a full state dict on CPU regardless of local sharding.
-        
-        This method must be called synchronously on all ranks to avoid deadlocks.
-        """
-        if isinstance(module, FSDP):
-            # Use FSDP's recommended state_dict API
-            # rank0_only=False ensures all ranks get the full state dict
-            # This is needed when multiple ranks may call state_dict() independently (e.g., vLLM)
-            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-            with FSDP.state_dict_type(module, StateDictType.FULL_STATE_DICT, save_policy):
-                state_dict = module.state_dict()
-        else:
-            state_dict = module.state_dict()
-
-        return {key: tensor.detach().cpu() for key, tensor in state_dict.items()}
-
-    def _load_model_state(self, module: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
-        """Load a CPU state dict into a (possibly sharded) module."""
-        if isinstance(module, FSDP):
-            with FSDP.summon_full_params(module, recurse=True):
-                module.load_state_dict(state_dict)
-        else:
-            module.load_state_dict(state_dict)
-        # FSDP will handle parameter offload automatically after loading
 
 
 class FSDPParameterFilter:

@@ -6,7 +6,17 @@ from math_verify import parse, verify
 from datetime import datetime
 from . import register_rm
 from sentence_transformers import SentenceTransformer, util
-sentence_tranformers_model = SentenceTransformer('all-MiniLM-L6-v2')  # light weight
+
+
+
+_sentence_transformers_model = None
+
+
+def get_sentence_transformer_model():
+    global _sentence_transformers_model
+    if _sentence_transformers_model is None:
+        _sentence_transformers_model = SentenceTransformer('all-MiniLM-L6-v2')  # light weight
+    return _sentence_transformers_model
 
 def normalize(s):
     def remove_articles(text):
@@ -39,7 +49,9 @@ def compute_f1(prediction, ground_truth):
     f1 = 2 * precision * recall / (precision + recall)
     return f1
 
-def compute_similarity(prediction, ground_truth, sentence_tranformers_model=sentence_tranformers_model):
+def compute_similarity(prediction, ground_truth, sentence_tranformers_model=None):
+    if sentence_tranformers_model is None:
+        sentence_tranformers_model = get_sentence_transformer_model()
     emb1 = sentence_tranformers_model.encode(prediction, convert_to_tensor=True)
     emb2 = sentence_tranformers_model.encode(ground_truth, convert_to_tensor=True)
     cosine_score = util.cos_sim(emb1, emb2)

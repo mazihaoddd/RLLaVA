@@ -27,8 +27,8 @@ CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 -m rllava.train.pipeline.rlvr
     data.format_prompt=./examples/format_prompt/agent_code.jinja \
     data.train_batch_size=4 \
     actor.ppo_mini_batch_size=4 \
-    actor.ppo_micro_batch_size_per_gpu=1 \
-    actor.log_prob_micro_batch_size_per_gpu=1 \
+    actor.ppo_micro_batch_size=1 \
+    actor.log_prob_micro_batch_size=1 \
     actor.model.model_path=${MODEL_PATH} \
     actor.fsdp.enable_cpu_offload=true \
     rollout.tensor_parallel_size=1 \

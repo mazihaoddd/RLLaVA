@@ -47,22 +47,21 @@ class PPO():
         
         if (
             self.config.data.train_batch_size * self.config.rollout.n
-        ) % self.config.actor.log_prob_micro_batch_size_per_gpu != 0:
+        ) % self.config.actor.log_prob_micro_batch_size != 0:
             raise ValueError(
                 "Rollout batch size * rollout.n must be divisible by actor micro batch size for experience."
             )
         
-        if config.rollout.n > 1:
-            self.config.actor.ppo_mini_batch_size *= config.rollout.n
-            print_rank_0(f"Actor will use global batch size {self.config.actor.ppo_mini_batch_size}.")
-        
+        self.config.actor.ppo_mini_batch_size *= config.rollout.n
+        print_rank_0(f"Actor will use global batch size {self.config.actor.ppo_mini_batch_size}.")
+
         if self.use_critic:
             if self.config.data.train_batch_size % self.config.critic.ppo_mini_batch_size != 0:
                 raise ValueError("Rollout batch size must be divisible by critic global batch size.")
 
             if (
                 self.config.data.train_batch_size * self.config.rollout.n
-            ) % self.config.critic.log_prob_micro_batch_size_per_gpu != 0:
+            ) % self.config.critic.log_prob_micro_batch_size != 0:
                 raise ValueError(
                     "Rollout batch size * rollout.n must be divisible by critic micro batch size for experience."
                 )
@@ -189,9 +188,7 @@ class PPO():
         return self.reward.compute_rewards(batch)
 
     def compute_log_probs(self, data: DataProto):
-        batch_size = len(data)
-        num_mini_batches = (batch_size + self.config.actor.global_batch_size_per_device - 1) // self.config.actor.global_batch_size_per_device
-        on_policy = num_mini_batches == 1 and self.config.actor.ppo_epochs == 1
+        on_policy = len(data) // self.config.actor.ppo_mini_batch_size == 1 and self.config.actor.ppo_epochs == 1
 
         self._process_multi_modal_inputs(data)
 

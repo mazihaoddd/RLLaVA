@@ -6,15 +6,15 @@ data:
   image_key: images
   video_key: videos
   video_fps: 2.0
-  max_prompt_length: 2048
-  max_response_length: 2048
+  max_prompt_length: 512
+  max_response_length: 512
   train_batch_size: 16 
   val_batch_size: 128
   format_prompt: ./examples/format_prompt/math.jinja
   override_chat_template: null
   shuffle: true
   seed: 1
-  min_pixels: 262144
+  min_pixels: 3136
   max_pixels: 4194304
   filter_overlong_prompts: true
 
@@ -27,8 +27,8 @@ algorithm:
 
 actor:
   ppo_mini_batch_size: 4  
-  ppo_micro_batch_size_per_gpu: 1  
-  log_prob_micro_batch_size_per_gpu: 2 
+  ppo_micro_batch_size: 1
+  log_prob_micro_batch_size: 2
   max_grad_norm: 1.0
   padding_free: true
   dynamic_batching: true

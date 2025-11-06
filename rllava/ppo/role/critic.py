@@ -185,10 +185,10 @@ class Critic():
 
         data = data.select(select_keys, non_tensor_select_keys)
         if self.config.dynamic_batching:
-            max_token_len = self.config.log_prob_micro_batch_size_per_gpu * data.batch["input_ids"].size(-1)
+            max_token_len = self.config.log_prob_micro_batch_size * data.batch["input_ids"].size(-1)
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(self.config.log_prob_micro_batch_size_per_gpu)
+            micro_batches = data.split(self.config.log_prob_micro_batch_size)
 
         values_lst = []
         if self.accelerator.is_main_process:
@@ -213,7 +213,7 @@ class Critic():
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         micro_batches = data.select(select_keys, non_tensor_select_keys).split(
-            self.config.log_prob_micro_batch_size_per_gpu
+            self.config.log_prob_micro_batch_size
         )
         values_lst = []
         if self.worker.rank == 0:
@@ -252,10 +252,10 @@ class Critic():
 
                 if self.config.dynamic_batching:
                     max_input_len = mini_batch.batch["input_ids"].size(-1)
-                    max_token_len = self.config.ppo_micro_batch_size_per_gpu * max_input_len
+                    max_token_len = self.config.ppo_micro_batch_size * max_input_len
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
 
                 if self.accelerator_manager.accelerator.is_main_process:
                     micro_batches = tqdm(micro_batches, desc="Update critic", position=2)

@@ -23,7 +23,7 @@ class DataConfig:
     override_chat_template: Optional[str] = None
     shuffle: bool = True
     seed: int = 1
-    min_pixels: Optional[int] = 262144
+    min_pixels: Optional[int] = 3136
     max_pixels: Optional[int] = 4194304
     num_workers: int = 8
     filter_overlong_prompts: bool = True

@@ -4,9 +4,8 @@ set -x
 
 export PYTHONUNBUFFERED=1
 
-# MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct  # replace it with your local file path
 MODEL_PATH="Qwen/Qwen2-VL-2B-Instruct"
-# 使用统一的本地数据集路径（HF cache格式）
+
 LOCAL_DATASET_PATH="Kangheng/PR1-Datasets-Grounding"
 
 TRAIN_SET="${LOCAL_DATASET_PATH}@train"
@@ -24,8 +23,8 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 -m rllava.train.pipeline.rlvr
     data.format_prompt=./examples/format_prompt/rec.jinja \
     data.train_batch_size=4 \
     actor.ppo_mini_batch_size=4 \
-    actor.ppo_micro_batch_size_per_gpu=1 \
-    actor.log_prob_micro_batch_size_per_gpu=1 \
+    actor.ppo_micro_batch_size=1 \
+    actor.log_prob_micro_batch_size=1 \
     actor.model.model_path=${MODEL_PATH} \
     rollout.tensor_parallel_size=1 \
     reward.reward_type=sequential \

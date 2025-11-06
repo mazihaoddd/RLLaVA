@@ -227,10 +227,10 @@ class Ref():
 
         micro_batches = data.select(select_keys, non_tensor_select_keys)
         if self.config.dynamic_batching:
-            max_token_len = self.config.log_prob_micro_batch_size_per_gpu * data.batch["input_ids"].size(-1)
+            max_token_len = self.config.log_prob_micro_batch_size * data.batch["input_ids"].size(-1)
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(self.config.log_prob_micro_batch_size_per_gpu)
+            micro_batches = data.split(self.config.log_prob_micro_batch_size)
 
         log_probs_lst = []
         if self.accelerator.is_main_process:

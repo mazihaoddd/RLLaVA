@@ -95,7 +95,7 @@ class HFAccelerator(TrainEngine):
                 },
                 "gradient_clipping": 1.0,
                 "train_batch_size": "auto",
-                "train_micro_batch_size_per_gpu": config.ppo_micro_batch_size_per_gpu,
+                "train_micro_batch_size_per_gpu": config.ppo_micro_batch_size,
             }
             deepspeed_plugin = DeepSpeedPlugin(
                 hf_ds_config=deepspeed_config,
@@ -178,37 +178,7 @@ class HFAccelerator(TrainEngine):
 
     def clip_grad_norm_(self, model, max_norm):
         return self.accelerator.clip_grad_norm_(model.parameters(), max_norm)
-    
-    def get_model_weights(self, model=None):
-        """Get model weights for syncing with inference engines.
-        
-        This method handles different distributed frameworks (FSDP, DeepSpeed, etc.)
-        and returns model weights in a format suitable for inference engines.
-        
-        Args:
-            model: The model to get weights from. If None, uses self.model.
-            
-        Returns:
-            Iterator over (name, tensor) pairs of model weights
-        """    
-        # Get the unwrapped model from accelerator
-        unwrapped_model = self.accelerator.unwrap_model(model)
 
-        # Handle different model types and configurations
-        if hasattr(model, '_fsdp_wrapped_module'):
-            weights = model.state_dict()
-        elif hasattr(model, '_orig_mod'):
-            # DeepSpeed wrapped model
-            import deepspeed
-            with deepspeed.zero.GatheredParameters(model.parameters()):
-                weights = unwrapped_model.state_dict()
-        else:
-            # Regular model (possibly wrapped by Accelerator)
-            weights = unwrapped_model.state_dict()
-        
-        return 
-
-    
     def _rename_weight_keys(self, weights: Dict[str, torch.Tensor], model) -> Dict[str, torch.Tensor]:
         """Convert state dict keys for compatibility.
         

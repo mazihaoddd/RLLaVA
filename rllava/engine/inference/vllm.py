@@ -219,7 +219,7 @@ class VLLMEngine(InferenceEngine):
         # Prepare vLLM engine and sync model weights per rollout; always wake then sleep
         torch.cuda.empty_cache()
         assert self.loaded is False, "vllm engine has already been loaded"
-        self.loaded = True
+
         
         print_gpu_memory_usage("Before vllm wake up in vllm engine")
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
@@ -230,6 +230,8 @@ class VLLMEngine(InferenceEngine):
         self.update_weights(model) # +4.9G
 
         print_gpu_memory_usage("After vllm wake up in vllm engine")
+
+        self.loaded = True
 
     def offload(self):
         assert self.loaded is True, "vllm engine has not been loaded"

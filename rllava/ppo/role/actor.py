@@ -65,15 +65,14 @@ class Actor():
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
 
-        world_size = self.accelerator.num_processes
-        self.config.global_batch_size_per_device = self.config.ppo_mini_batch_size // (world_size // self.config.ulysses_size)
-        if self.config.global_batch_size_per_device == 0:
-            raise ValueError(f"Actor global batch size * ulysses size must be larger than num gpus.")
+        self.config.ppo_mini_batch_size = self.config.ppo_mini_batch_size // self.accelerator.num_processes
+        if self.config.ppo_mini_batch_size == 0:
+            raise ValueError(f"Actor mini batch size on per device must be larger than 0.")
 
-        if self.config.global_batch_size_per_device % self.config.ppo_micro_batch_size_per_gpu != 0:
-            raise ValueError(f"Actor global batch size per device must be divisible by the micro batch size.")
+        if self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size != 0:
+            raise ValueError(f"Actor mini batch size on per device must be divisible by the micro batch size.")
         
-        print_rank_0(f"Actor will use global batch size per device {self.config.global_batch_size_per_device}.")
+        print_rank_0(f"Actor will use mini batch size on per device {self.config.ppo_mini_batch_size}.")
 
     def initialize(self):
         self.model_config = AutoConfig.from_pretrained(
@@ -337,10 +336,10 @@ class Actor():
 
         micro_batches = data.select(select_keys, non_tensor_select_keys)
         if self.config.dynamic_batching:
-            max_token_len = self.config.log_prob_micro_batch_size_per_gpu * data.batch["input_ids"].size(-1)
+            max_token_len = self.config.log_prob_micro_batch_size * data.batch["input_ids"].size(-1)
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(self.config.log_prob_micro_batch_size_per_gpu)
+            micro_batches = data.split(self.config.log_prob_micro_batch_size)
 
         log_probs_lst = []
         if self.accelerator.is_main_process:
@@ -422,16 +421,14 @@ class Actor():
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         # Calculate number of mini_batches to determine on_policy before actual data selection
-        batch_size = len(data)
-        num_mini_batches = (batch_size + self.config.global_batch_size_per_device - 1) // self.config.global_batch_size_per_device
-        on_policy = num_mini_batches == 1 and self.config.ppo_epochs == 1
+        on_policy = len(data) // self.config.ppo_mini_batch_size == 1 and self.config.ppo_epochs == 1
 
         if not on_policy:
             select_keys.append("old_log_probs")
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
+        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.ppo_mini_batch_size)
 
         metrics = defaultdict(list)
         for _ in range(self.config.ppo_epochs):
@@ -440,13 +437,15 @@ class Actor():
             for mini_batch in mini_batches:
                 if self.config.dynamic_batching:
                     max_input_len = mini_batch.batch["input_ids"].size(-1)
-                    max_token_len = self.config.ppo_micro_batch_size_per_gpu * max_input_len
+                    max_token_len = self.config.ppo_micro_batch_size * max_input_len
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
-                        self.config.global_batch_size_per_device // self.config.ppo_micro_batch_size_per_gpu
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
                     )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
+
+                self.optimizer.zero_grad()
 
                 micro_batches = tqdm(micro_batches, desc="Update policy", position=2, disable=not self.accelerator.is_main_process)
                 for micro_batch in micro_batches:
@@ -457,7 +456,7 @@ class Actor():
                     advantages = model_inputs["advantages"]
 
                     if self.config.dynamic_batching:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_micro_batch_size_per_gpu
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
@@ -526,7 +525,7 @@ class Actor():
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
      
                     loss = policy_loss * loss_scale_factor
-                    self.accelerator.backward(loss)
+                    self.accelerator.backward(loss) # 14.7-24.2-25.2    27.5-30.4-30.4
 
                     micro_batch_metrics.update(
                         {
@@ -538,7 +537,7 @@ class Actor():
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                grad_norm = self._optimizer_step() # 25.2 -> 25.3
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         self.optimizer.zero_grad()

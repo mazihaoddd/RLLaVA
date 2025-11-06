@@ -26,8 +26,8 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 --master_port=29512 -m rlla
     data.format_prompt=./examples/format_prompt/math.jinja \
     data.train_batch_size=4 \
     actor.ppo_mini_batch_size=4 \
-    actor.ppo_micro_batch_size_per_gpu=1 \
-    actor.log_prob_micro_batch_size_per_gpu=1 \
+    actor.ppo_micro_batch_size=1 \
+    actor.log_prob_micro_batch_size=1 \
     actor.model.model_path=${MODEL_PATH} \
     reward.reward_function=./examples/reward_function/math.py:compute_score \
     trainer.experiment_name=${NAME} \
