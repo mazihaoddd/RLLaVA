@@ -72,8 +72,8 @@ class Ref():
                 self.config.model.model_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation=self.config.model.attn_implementation,
                 trust_remote_code=self.config.model.trust_remote_code,
+                attn_implementation=self.config.model.attn_implementation,
             )
 
             apply_monkey_patch(

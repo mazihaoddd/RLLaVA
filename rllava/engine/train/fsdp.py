@@ -114,20 +114,20 @@ class FSDPAccelerator(TrainEngine):
         
         if self.fsdp_config.offload_params:
             log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
-            load_fsdp_model_to_gpu(model)
+            self.load_fsdp_model_to_gpu(model)
             log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
         yield model  # we use wrapped model for FSDP
         
         if self.fsdp_config.offload_params:
             log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
-            offload_fsdp_model_to_cpu(model)
+            self.offload_fsdp_model_to_cpu(model)
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
     @contextmanager
     def eval(self, model: FSDP):
         if self.fsdp_config.offload_params:
-            load_fsdp_model_to_gpu(model)
+            self.load_fsdp_model_to_gpu(model)
         model.eval()
 
         yield
@@ -136,14 +136,14 @@ class FSDPAccelerator(TrainEngine):
             model._handle.reshard(True)
 
         if self.fsdp_config.offload_params:
-            offload_fsdp_model_to_cpu(model)
+            self.offload_fsdp_model_to_cpu(model)
 
     @contextmanager
     def train(self, model: FSDP, optimizer: Optimizer):
         if self.fsdp_config.offload_params:
-            load_fsdp_model_to_gpu(model)
+            self.load_fsdp_model_to_gpu(model)
         if self.fsdp_config.offload_optimizer:
-            load_fsdp_optimizer(optimizer, device_id=get_device_id())
+            self.load_fsdp_optimizer(optimizer, device_id=get_device_id())
         model.train()
 
         yield
@@ -152,18 +152,18 @@ class FSDPAccelerator(TrainEngine):
             model._handle.reshard(True)
 
         if self.fsdp_config.offload_params:
-            offload_fsdp_model_to_cpu(model)
+            self.offload_fsdp_model_to_cpu(model)
         if self.fsdp_config.offload_optimizer:
-            offload_fsdp_optimizer(optimizer)
+            self.offload_fsdp_optimizer(optimizer)
 
     def load_state(self, model: FSDP, optimizer: Optimizer, lr_scheduler: LRScheduler, local_path: str):
         if local_path is None:
             return
 
         if self.fsdp_config.offload_params:
-            load_fsdp_model_to_gpu(model)
+            self.load_fsdp_model_to_gpu(model)
         if self.fsdp_config.offload_optimizer:
-            load_fsdp_optimizer(optimizer, device_id=get_device_id())
+            self.load_fsdp_optimizer(optimizer, device_id=get_device_id())
 
         state_dict_cfg = (
             ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
@@ -175,7 +175,7 @@ class FSDPAccelerator(TrainEngine):
             if 'optimizer' in self.checkpoint_config.load_contents
             else None
         )
-        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+        with self.get_fsdp_state_ctx(model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             if 'model' in self.checkpoint_config.load_contents:
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
@@ -209,18 +209,18 @@ class FSDPAccelerator(TrainEngine):
         self.wait_for_everyone()
 
         if self.fsdp_config.offload_params:
-            offload_fsdp_model_to_cpu(model)
+            self.offload_fsdp_model_to_cpu(model)
         if self.fsdp_config.offload_optimizer:
-            offload_fsdp_optimizer(optimizer)
+            self.offload_fsdp_optimizer(optimizer)
 
     def save_state(self, model: FSDP, optimizer: Optimizer, lr_scheduler: LRScheduler, local_path: str):
         if local_path is None:
             return
 
         if self.fsdp_config.offload_params:
-            load_fsdp_model_to_gpu(model)
+            self.load_fsdp_model_to_gpu(model)
         if self.fsdp_config.offload_optimizer:
-            load_fsdp_optimizer(optimizer, device_id=get_device_id())
+            self.load_fsdp_optimizer(optimizer, device_id=get_device_id())
             
         local_path = local_mkdir_safe(local_path)
         self.wait_for_everyone()
@@ -229,7 +229,7 @@ class FSDPAccelerator(TrainEngine):
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+            with self.get_fsdp_state_ctx(model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
                 model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
@@ -256,12 +256,15 @@ class FSDPAccelerator(TrainEngine):
         self.wait_for_everyone()
 
         if self.fsdp_config.offload_params:
-            offload_fsdp_model_to_cpu(model)
+            self.offload_fsdp_model_to_cpu(model)
         if self.fsdp_config.offload_optimizer:
-            offload_fsdp_optimizer(optimizer)
+            self.offload_fsdp_optimizer(optimizer)
 
     def backward(self, loss: torch.Tensor):
         loss.backward()
+
+    def get_fsdp_state_ctx(self, model, state_type, state_cfg, optim_cfg):
+        return FSDP.state_dict_type(model, state_type, state_cfg, optim_cfg)
 
     def clip_grad_norm_(self, model: FSDP, max_norm: float):
         grad_norm = model.clip_grad_norm_(max_norm)
@@ -301,7 +304,7 @@ class FSDPAccelerator(TrainEngine):
             buffer_dtype = torch.float32
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(
+        auto_wrap_policy = self.get_fsdp_wrap_policy(
             module=module,
             config=self.fsdp_config.wrap_policy,
             is_lora=self.config.model.use_peft
@@ -348,7 +351,7 @@ class FSDPAccelerator(TrainEngine):
 
         if not forward_only:
             if self.fsdp_config.offload_params:
-                offload_fsdp_model_to_cpu(wrapped_module)
+                self.offload_fsdp_model_to_cpu(wrapped_module)
                 log_gpu_memory_usage("After offload model during init", logger=logger)
 
         return wrapped_module
@@ -357,12 +360,140 @@ class FSDPAccelerator(TrainEngine):
         if optimizer not in self.optimizers:
             self.optimizers.append(optimizer)
             if self.fsdp_config.offload_optimizer:
-                offload_fsdp_optimizer(optimizer=optimizer)
+                self.offload_fsdp_optimizer(optimizer=optimizer)
                 log_gpu_memory_usage("After offload optimizer during init", logger=logger)
 
     def _register_lr_scheduler(self, scheduler: LRScheduler, **kwargs: Any) -> None:
         if scheduler not in self.lr_schedulers:
             self.lr_schedulers.append(scheduler)
+
+    @torch.no_grad()
+    def load_fsdp_model_to_gpu(self, model: FSDP):
+        # lazy init FSDP model
+        _lazy_init(model, model)
+        assert model._is_root, "Only support root model loading to GPU"
+        device_id = get_device_id()
+        for handle in model._all_handles:
+            if handle._offload_params:
+                continue
+            flat_param = handle.flat_param
+            handle.flat_param_to(torch.device(f"{get_device_name()}:{device_id}"), non_blocking=True)
+            # the following still keeps id(._local_shard) != id(.data)
+            flat_param._local_shard = flat_param.data
+    
+    @torch.no_grad()
+    def offload_fsdp_model_to_cpu(self, model: FSDP, empty_cache: bool = True):
+        # lazy init FSDP model
+        _lazy_init(model, model)
+        assert model._is_root, "Only support root model offloading to CPU"
+        for handle in model._all_handles:
+            if handle._offload_params:
+                continue
+            flat_param = handle.flat_param
+            assert (
+                flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+                and id(flat_param.data) != id(flat_param._local_shard)
+                and flat_param.data.size() == flat_param._local_shard.size()
+            )
+            handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+            # the following still keeps id(._local_shard) != id(.data)
+            flat_param._local_shard = flat_param.data
+            assert id(flat_param._local_shard) != id(flat_param.data)
+        if empty_cache:
+            get_torch_device().empty_cache()
+
+    @torch.no_grad()
+    def offload_fsdp_optimizer(self, optimizer):
+        if not optimizer.state:
+            return
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                state = optimizer.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to("cpu", non_blocking=True)
+
+    @torch.no_grad()
+    def load_fsdp_optimizer(self, optimizer, device_id):
+        if not optimizer.state:
+            return
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                state = optimizer.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to(device_id, non_blocking=True)
+
+    # Copyright 2020-present the HuggingFace Inc. team.
+    # Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
+    def get_fsdp_wrap_policy(self, module, config=None, is_lora=False):
+        """Get FSDP wrap policy for the module.
+    
+        Args:
+            module: The module to get wrap policy for
+            config: Configuration for wrap policy
+            is_lora: Whether to enable lambda policy for LoRA modules
+        """
+        if config is None:
+            config = {}
+    
+        # NOTE: This is a temporary workaround to be compatible with the OmegaConf & dataclass. We will remove this
+        # once we have make all config in verl from OmegaConf to data class.
+        def _get_attr(attr_name, default_value=None):
+            if hasattr(config, "get"):
+                return config.get(attr_name, default_value)
+            else:
+                return config.__getattribute__(attr_name)
+    
+        if _get_attr("disable", False):
+            return None
+    
+        default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
+        fsdp_transformer_layer_cls_to_wrap = _get_attr(
+            "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
+        )
+        min_num_params = _get_attr("min_num_params", 0)
+        auto_wrap_policy = None
+    
+        policies = []
+    
+        from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy
+    
+        # Add lambda policy for LoRA modules if is_lora is True
+        if is_lora:
+    
+            def lambda_policy_fn(module):
+                return bool(
+                    len(list(module.named_children())) == 0
+                    and getattr(module, "weight", None) is not None
+                    and module.weight.requires_grad
+                )
+    
+            lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+            policies.append(lambda_policy)
+    
+        if min_num_params > 0:
+            size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+            policies.append(size_policy)
+        elif fsdp_transformer_layer_cls_to_wrap is not None:
+            transformer_cls_to_wrap = set()
+            for layer_class in fsdp_transformer_layer_cls_to_wrap:
+                transformer_cls = get_module_class_from_name(module, layer_class)
+                if transformer_cls is None:
+                    raise Exception("Could not find the transformer layer class to wrap in the model.")
+                else:
+                    transformer_cls_to_wrap.add(transformer_cls)
+    
+            transformer_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=transformer_cls_to_wrap,
+            )
+            policies.append(transformer_policy)
+    
+        if len(policies) > 0:
+            auto_wrap_policy = functools.partial(_or_policy, policies=policies)
+    
+        return auto_wrap_policy
 
 
 class FSDPParameterFilter:
@@ -811,77 +942,6 @@ def _get_unique_tensor_key(tensor):
     key = (tensor.untyped_storage().data_ptr() + tensor.storage_offset(), tensor.dtype)
     return key
 
-# Copyright 2020-present the HuggingFace Inc. team.
-# Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
-def get_fsdp_wrap_policy(module, config=None, is_lora=False):
-    """Get FSDP wrap policy for the module.
-
-    Args:
-        module: The module to get wrap policy for
-        config: Configuration for wrap policy
-        is_lora: Whether to enable lambda policy for LoRA modules
-    """
-    if config is None:
-        config = {}
-
-    # NOTE: This is a temporary workaround to be compatible with the OmegaConf & dataclass. We will remove this
-    # once we have make all config in verl from OmegaConf to data class.
-    def _get_attr(attr_name, default_value=None):
-        if hasattr(config, "get"):
-            return config.get(attr_name, default_value)
-        else:
-            return config.__getattribute__(attr_name)
-
-    if _get_attr("disable", False):
-        return None
-
-    default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
-    fsdp_transformer_layer_cls_to_wrap = _get_attr(
-        "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
-    )
-    min_num_params = _get_attr("min_num_params", 0)
-    auto_wrap_policy = None
-
-    policies = []
-
-    from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy
-
-    # Add lambda policy for LoRA modules if is_lora is True
-    if is_lora:
-
-        def lambda_policy_fn(module):
-            return bool(
-                len(list(module.named_children())) == 0
-                and getattr(module, "weight", None) is not None
-                and module.weight.requires_grad
-            )
-
-        lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
-        policies.append(lambda_policy)
-
-    if min_num_params > 0:
-        size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
-        policies.append(size_policy)
-    elif fsdp_transformer_layer_cls_to_wrap is not None:
-        transformer_cls_to_wrap = set()
-        for layer_class in fsdp_transformer_layer_cls_to_wrap:
-            transformer_cls = get_module_class_from_name(module, layer_class)
-            if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
-            else:
-                transformer_cls_to_wrap.add(transformer_cls)
-
-        transformer_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=transformer_cls_to_wrap,
-        )
-        policies.append(transformer_policy)
-
-    if len(policies) > 0:
-        auto_wrap_policy = functools.partial(_or_policy, policies=policies)
-
-    return auto_wrap_policy
-
 def init_fn(x: torch.nn.Module):
     if torch.distributed.get_rank() != 0:
         x = x.to_empty(device=get_device_id(), recurse=False)
@@ -963,63 +1023,6 @@ def enable_activation_offloading(model, enable_ckpt=False):
         if isinstance(layer, FSDP):
             module = module._fsdp_wrapped_module
         handler.wrap_module_forward_method(module)
-
-@torch.no_grad()
-def load_fsdp_model_to_gpu(model: FSDP):
-    # lazy init FSDP model
-    _lazy_init(model, model)
-    assert model._is_root, "Only support root model loading to GPU"
-    device_id = get_device_id()
-    for handle in model._all_handles:
-        if handle._offload_params:
-            continue
-        flat_param = handle.flat_param
-        handle.flat_param_to(torch.device(f"{get_device_name()}:{device_id}"), non_blocking=True)
-        # the following still keeps id(._local_shard) != id(.data)
-        flat_param._local_shard = flat_param.data
-
-@torch.no_grad()
-def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
-    # lazy init FSDP model
-    _lazy_init(model, model)
-    assert model._is_root, "Only support root model offloading to CPU"
-    for handle in model._all_handles:
-        if handle._offload_params:
-            continue
-        flat_param = handle.flat_param
-        assert (
-            flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
-            and id(flat_param.data) != id(flat_param._local_shard)
-            and flat_param.data.size() == flat_param._local_shard.size()
-        )
-        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
-        # the following still keeps id(._local_shard) != id(.data)
-        flat_param._local_shard = flat_param.data
-        assert id(flat_param._local_shard) != id(flat_param.data)
-    if empty_cache:
-        get_torch_device().empty_cache()
-
-@torch.no_grad()
-def offload_fsdp_optimizer(optimizer):
-    if not optimizer.state:
-        return
-    for param_group in optimizer.param_groups:
-        for param in param_group["params"]:
-            state = optimizer.state[param]
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    state[key] = value.to("cpu", non_blocking=True)
-
-@torch.no_grad()
-def load_fsdp_optimizer(optimizer, device_id):
-    if not optimizer.state:
-        return
-    for param_group in optimizer.param_groups:
-        for param in param_group["params"]:
-            state = optimizer.state[param]
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    state[key] = value.to(device_id, non_blocking=True)
 
 def create_device_mesh(world_size, fsdp_size):
     device_name = get_device_name()

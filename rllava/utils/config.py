@@ -255,6 +255,7 @@ class FSDPConfig:
     torch_dtype: Optional[str] = None
     offload_params: bool = False
     offload_optimizer: bool = False
+    reshard_after_forward: bool = True
     forward_prefetch: bool = False
     fsdp_size: int = -1
     ulysses_size: int = 1

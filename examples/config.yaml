@@ -73,7 +73,7 @@ reward:
 trainer:
   total_epochs: 15
   max_steps: null
-  project_name: rlava
+  project_name: rllava
   experiment_name: qwen2_5_7b_math_grpo
   logger: ["console", "tensorboard"]
   nnodes: 1

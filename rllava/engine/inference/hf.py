@@ -2,17 +2,20 @@ import os
 import torch
 import logging
 import contextlib
+import numpy as np
 from tqdm import tqdm
-from typing import Optional, TYPE_CHECKING
-from transformers import PreTrainedTokenizer, ProcessorMixin
+from typing import Optional, Dict, TYPE_CHECKING
+from collections import defaultdict
+from transformers import PreTrainedTokenizer, ProcessorMixin, AutoModelForVision2Seq, AutoModelForCausalLM, AutoConfig, GenerationConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from .base import InferenceEngine
 from .. import register_engine
 from rllava.utils import torch_functional as VF
 from tensordict import TensorDict
-from transformers import GenerationConfig
 from rllava.data.protocol import DataProto
+from rllava.data.data_utils import process_image, process_video
 from rllava.utils.performance import log_gpu_memory_usage
+from rllava.utils.logger.aggregate_logger import print_rank_0
 
 
 
@@ -36,6 +39,73 @@ class HFEngine(InferenceEngine):
         super().__init__(model_name_or_path, config, tokenizer, processor)
         self.model = None
         self.loaded = False
+
+        self.model_config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=self.config.trust_remote_code,
+            bos_token_id=self.tokenizer.bos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            attn_implementation='flash_attention_2'
+        )
+        print_rank_0(f"Inference Model config: {self.model_config}")
+
+        if type(self.model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            model_class = AutoModelForVision2Seq
+        else:
+            model_class = AutoModelForCausalLM
+        
+        self.model = model_class.from_pretrained(
+                model_name_or_path,
+                config=self.model_config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=self.config.trust_remote_code,
+            )
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.eval()
+
+    def _process_multi_modal_inputs(self, data: DataProto):
+        """
+        Process multi-modal data from dataloader format to model input format.
+        Converts multi_modal_data (raw images/videos) to multi_modal_inputs (processed tensors).
+        """
+        if "multi_modal_data" not in data.non_tensor_batch:
+            return
+        
+        if "multi_modal_inputs" in data.non_tensor_batch:
+            # Already processed
+            return
+        
+        else:
+            min_pixels = data.meta_info["min_pixels"]
+            max_pixels = data.meta_info["max_pixels"]
+            video_fps = data.meta_info["video_fps"]
+            batch_multi_modal_inputs = []
+            
+            for multi_modal_data in data.non_tensor_batch["multi_modal_data"]:
+                images, videos = [], []
+                if "images" in multi_modal_data:
+                    for image in multi_modal_data["images"]:
+                        images.append(process_image(image, min_pixels, max_pixels))
+                
+                if "videos" in multi_modal_data:
+                    for video in multi_modal_data["videos"]:
+                        videos.append(process_video(video, min_pixels, max_pixels, video_fps))
+                
+                if len(images) != 0:      
+                    multi_modal_inputs = dict(self.processor.image_processor(images=images, return_tensors="pt"))
+                elif len(videos) != 0:
+                    multi_modal_inputs = dict(
+                        self.processor.image_processor(images=None, videos=videos, return_tensors="pt")
+                    )
+                else:
+                    multi_modal_inputs = {}
+                
+                batch_multi_modal_inputs.append(multi_modal_inputs)
+            
+            data.non_tensor_batch["multi_modal_inputs"] = np.array(batch_multi_modal_inputs, dtype=object)
 
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
         temperature = prompts.meta_info.get("temperature", self.config.temperature)
@@ -74,21 +144,25 @@ class HFEngine(InferenceEngine):
             "return_dict_in_generate": True,
             "use_cache": True,
         }
-        # Check if this is a multimodal task by checking for image-related fields
-        is_multimodal = "pixel_values" in prompts.batch and "image_grid_thw" in prompts.batch
-        if is_multimodal:
-            prompt_inputs["pixel_values"] = prompts.batch["pixel_values"]
-            prompt_inputs["image_grid_thw"] = prompts.batch["image_grid_thw"]    
 
-        self.model.eval()
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.model, FSDP):
-            # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
-            param_ctx = FSDP.summon_full_params(self.model, writeback=False, recurse=False)
+        # Merge multi_modal_inputs into prompt_inputs
+        if "multi_modal_inputs" in prompts.non_tensor_batch:
+            multi_modal_inputs = defaultdict(list)
+            for input_dict in prompts.non_tensor_batch["multi_modal_inputs"]:
+                for key, value in input_dict.items():
+                    multi_modal_inputs[key].append(value)
+            
+            for key, value in multi_modal_inputs.items():
+                if len(value) != 0:
+                    concatenated = torch.cat(value, dim=0)
+                    # Move to the same device as input_ids
+                    prompt_inputs[key] = concatenated.to(device=input_ids.device)
+                else:
+                    prompt_inputs[key] = None
 
-        with param_ctx, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             output = self.model.generate(**prompt_inputs, 
-                                         generation_config=self.generation_config)
+                                        generation_config=self.generation_config)
         seq = output.sequences
         generated_batch_size = seq.size(0)  # bs * num_return_sequences
 
@@ -112,15 +186,15 @@ class HFEngine(InferenceEngine):
         
         # Handle Qwen2-VL MRoPE 3D position_ids
         if position_ids.dim() == 3:  # qwen2vl mrope
-            delta_position_id = delta_position_id.view(generated_batch_size, 1, -1).expand(generated_batch_size, 3, -1)
+            delta_position_id = delta_position_id.view(generated_batch_size, 1, -1).expand(generated_batch_size, position_ids.size(1), -1)
 
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
-        response_attention_mask = VF.get_response_mask(
+        response_mask = VF.get_response_mask(
             response_ids=response, eos_token_id=eos_token_id, dtype=attention_mask.dtype
         )
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
         batch = TensorDict(
             {
@@ -128,18 +202,23 @@ class HFEngine(InferenceEngine):
                 "responses": response,
                 "input_ids": seq,
                 "attention_mask": attention_mask,
-                "response_mask": response_attention_mask,
+                "response_mask": response_mask,
                 "position_ids": position_ids,
             },
             batch_size=generated_batch_size,
         )
         # empty cache before compute old_log_prob
         torch.cuda.empty_cache()
-        self.model.train()
 
-        return DataProto(batch=batch)
+        if "multi_modal_data" in prompts.non_tensor_batch:
+            non_tensor_batch = {"multi_modal_data": prompts.non_tensor_batch["multi_modal_data"]}
+        else:
+            non_tensor_batch = {}
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
 
     def generate(self, prompts: DataProto) -> DataProto:
+        self._process_multi_modal_inputs(prompts)
         prompts = prompts.to(torch.cuda.current_device())
         num_return_sequences = prompts.meta_info.get("n", getattr(self.config, "n", 1))
         prompts = prompts.repeat(repeat_times=num_return_sequences, interleave=True)
@@ -161,21 +240,50 @@ class HFEngine(InferenceEngine):
         return output
 
     def update_weights(self, model):
-        self.model = model
+        weights = model.state_dict()
+        weights_iter = self._make_weight_iterator(weights)
+        
+        processed_weights = {name: tensor for name, tensor in weights_iter}
+        
+        missing_keys, unexpected_keys = self.model.load_state_dict(processed_weights, strict=False)
+        
+        if missing_keys:
+            print_rank_0(f"Warning: Missing keys when loading weights: {missing_keys[:5]}...")  
+        if unexpected_keys:
+            print_rank_0(f"Warning: Unexpected keys when loading weights: {unexpected_keys[:5]}...")  
+        
+        # 将模型移到 CUDA 设备
+        self.model = self.model.to(torch.cuda.current_device())
+        
+        torch.cuda.empty_cache()
 
     def load(self, model):
         torch.cuda.empty_cache()
         assert self.loaded is False, "hf engine has already been loaded"
 
-        log_gpu_memory_usage("Before hf wake up in hf engine", logger=logger)  
         self.update_weights(model)
-        log_gpu_memory_usage("After hf wake up in hf engine", logger=logger)
         self.loaded = True
 
     def offload(self):
         assert self.loaded is True, "hf engine has not been loaded"
-        self.model = None
-        self.loaded = False
         
+        self.model = self.model.to('cpu')
+        torch.cuda.empty_cache()
+        self.loaded = False
 
-    
+    def _make_weight_iterator(self, weights: Dict[str, torch.Tensor]):
+        """Create an iterator over model weights.
+        
+        Args:
+            actor_weights: Model weights dictionary
+            
+        Returns:
+            Iterator over (name, tensor) pairs
+        """
+        for name in sorted(weights.keys()):
+            tensor = weights[name]
+            # Handle DTensor for distributed training
+            if hasattr(tensor, 'full_tensor'):
+                yield name, tensor.full_tensor() if self.world_size != 1 else tensor
+            else:
+                yield name, tensor 

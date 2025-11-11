@@ -64,9 +64,15 @@ class Rollout():
         return output
 
     def generate_one_batch(self, data: DataProto, filter: Callable = lambda sample: sample, val=False) -> DataProto:  
+        # uid
+        import uuid
+        data.non_tensor_batch["uid"] = np.array([
+            str(uuid.uuid4()) for _ in range(len(data.batch))
+        ], dtype=object)
+
         # pop keys for generation
         gen_batch = data.pop(
-            batch_keys=["input_ids", "attention_mask", "position_ids", "pixel_values", "image_grid_thw"],
+            batch_keys=["input_ids", "attention_mask", "position_ids"],
             non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
             meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
         )
@@ -100,11 +106,7 @@ class Rollout():
             new_batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
             new_batch.batch["reward_baselines"] = reward_baseline_tensor
             del gen_baseline_batch, gen_baseline_output
-        # uid
-        import uuid
-        data.non_tensor_batch["uid"] = np.array([
-            str(uuid.uuid4()) for _ in range(len(data.batch))
-        ], dtype=object)
+        
         # repeat to align with repeated responses in rollout
         data = data.repeat(repeat_times=self.config.n, interleave=True)
         new_batch = data.union(gen_batch_output)

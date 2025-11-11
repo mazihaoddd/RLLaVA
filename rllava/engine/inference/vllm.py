@@ -1,23 +1,27 @@
 import inspect
 import torch
-from typing import Optional, List, Iterable, Tuple, TYPE_CHECKING, Dict
-from transformers import PreTrainedTokenizer, ProcessorMixin
+import re
+import time
+from typing import Optional, List, Iterable, Tuple, Dict, Union, TYPE_CHECKING
+from transformers import PreTrainedTokenizer, ProcessorMixin, PreTrainedModel
 from contextlib import contextmanager
 from .base import InferenceEngine
 from .. import register_engine
-from rllava.utils import torch_functional as VF
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
-from rllava.utils.torch_dtypes import PrecisionType
-from rllava.data.protocol import DataProto
 from vllm import RequestOutput
 from vllm.lora.request import LoRARequest
 from peft.utils.save_and_load import get_peft_model_state_dict
-import time
-from .utils import TensorLoRARequest, VLLMHijack
 from dataclasses import asdict
 from .base import _get_logit_bias, _process_multi_modal_data, _repeat_interleave
+from .utils import TensorLoRARequest, VLLMHijack
+from rllava.data.protocol import DataProto
+from rllava.utils import torch_functional as VF
 from rllava.utils.model_utils import print_gpu_memory_usage
+from rllava.utils.torch_dtypes import PrecisionType
+from rllava.utils.transformers_compat import is_transformers_version_in_range
+from torch.distributed.tensor import DTensor
+ 
 if TYPE_CHECKING:
     from rllava.ppo.config import RolloutConfig
 
@@ -163,9 +167,6 @@ class VLLMEngine(InferenceEngine):
         if position_ids.dim() == 3:  # qwen2vl mrope
             delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
 
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1 | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3 | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_mask = VF.get_response_mask(
@@ -192,6 +193,26 @@ class VLLMEngine(InferenceEngine):
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
 
+    def _rename_weight_keys(self, actor_weights: dict[str, Union[torch.Tensor, DTensor]], model: PreTrainedModel):
+        # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
+        if not hasattr(model, "_checkpoint_conversion_mapping"):
+            return actor_weights
+
+        reverse_key_mapping = {v: k for k, v in model._checkpoint_conversion_mapping.items()}
+        original_weights = {}
+        for key, value in actor_weights.items():
+            for pattern, replacement in reverse_key_mapping.items():
+                replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+                replacement = re.sub(r"\(.*\)", "", replacement)
+                key, n_replace = re.subn(pattern, replacement, key)
+                # Early exit of the loop
+                if n_replace > 0:
+                    break
+
+            original_weights[key] = value
+
+        return original_weights
+
     def update_weights(self, model):
         if self.lora_kwargs:
             weights = get_peft_model_state_dict(model)
@@ -207,6 +228,8 @@ class VLLMEngine(InferenceEngine):
             self.inference_engine.llm_engine.add_lora(lora_request)
         else:
             weights = model.state_dict()
+            if is_transformers_version_in_range(min_version="4.54.0"):
+                weights = self._rename_weight_keys(weights, model)
             weights_iter = self._make_weight_iterator(weights)
             vllm_model = (
                 self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
@@ -219,7 +242,7 @@ class VLLMEngine(InferenceEngine):
         # Prepare vLLM engine and sync model weights per rollout; always wake then sleep
         torch.cuda.empty_cache()
         assert self.loaded is False, "vllm engine has already been loaded"
-
+        
         
         print_gpu_memory_usage("Before vllm wake up in vllm engine")
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
@@ -230,7 +253,7 @@ class VLLMEngine(InferenceEngine):
         self.update_weights(model) # +4.9G
 
         print_gpu_memory_usage("After vllm wake up in vllm engine")
-
+        
         self.loaded = True
 
     def offload(self):
@@ -256,7 +279,7 @@ class VLLMEngine(InferenceEngine):
             tensor = weights[name]
             # Handle DTensor for distributed training
             if hasattr(tensor, 'full_tensor'):
-                yield name, tensor.full_tensor() if self.world_size != 1 else tensor
+                yield name, tensor.full_tensor() if (self.world_size != 1 or isinstance(tensor, DTensor)) else tensor
             else:
                 yield name, tensor 
 

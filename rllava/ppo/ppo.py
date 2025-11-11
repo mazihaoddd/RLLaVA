@@ -152,9 +152,8 @@ class PPO():
                 batch_in = dist_batch(data_iterator)
 
                 new_batch = self.rollout.generate_one_batch(batch_in, self.filter)
-                # print('before gather', len(new_batch))
                 new_batch = gather_batch(new_batch)
-                # print('after gather', len(new_batch))
+
                 batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
                 current_batch_size = len(batch) // self.rollout.n
                 rollout_batch_size = self.train_batch_size

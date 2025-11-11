@@ -35,6 +35,8 @@ class HFAccelerator(TrainEngine):
     
     def __init__(self, config):
         self.config = config
+
+        self.device_mesh = None
         if config.strategy == "fsdp":
             # Build FSDP configuration using only existing FSDPConfig fields
             fsdp_config = {
@@ -145,27 +147,40 @@ class HFAccelerator(TrainEngine):
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model)
-    
-    def unwrap_model_for_generation(self, model, is_peft_model: bool = False,):
 
-        @contextmanager
-        def _unwrap_model_for_generation():
-            # Always unwrap the model for a clean interface downstream
-            unwrapped_model = self.accelerator.unwrap_model(model)
-            
-            if is_peft_model and hasattr(unwrapped_model, "pretrained_model"):
-                unwrapped_model.pretrained_model.disable_adapter()
-            
-            if self.accelerator.state.deepspeed_plugin is not None and self.accelerator.state.deepspeed_plugin.zero_stage == 3:
-                with deepspeed.zero.GatheredParameters(model.parameters()):
-                    remove_hooks(model)
-                    yield self.accelerator.unwrap_model(model)
-                    add_hooks(model)
-            elif self.accelerator.state.fsdp_plugin is not None:
-                yield model
-            else:
-                yield unwrapped_model
-        return _unwrap_model_for_generation
+    @contextmanager
+    def unwrap_model_for_generation(self, model, is_peft_model: bool = False):
+        # Always unwrap the model for a clean interface downstream
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        
+        if is_peft_model and hasattr(unwrapped_model, "pretrained_model"):
+            unwrapped_model.pretrained_model.disable_adapter()
+        
+        if self.accelerator.state.deepspeed_plugin is not None and self.accelerator.state.deepspeed_plugin.zero_stage == 3:
+            with deepspeed.zero.GatheredParameters(model.parameters()):
+                remove_hooks(model)
+                yield self.accelerator.unwrap_model(model)
+                add_hooks(model)
+        elif self.accelerator.state.fsdp_plugin is not None:
+            yield model
+
+    @contextmanager
+    def eval(self, model):
+        model.to(torch.cuda.current_device())
+        model.eval()
+
+        yield
+
+        model.to('cpu')
+
+    @contextmanager
+    def train(self, model, optimizer):
+        model.to(torch.cuda.current_device())
+        model.train()
+
+        yield
+
+        model.to('cpu')
 
     def load_state(self, model, optimizer, lr_scheduler, checkpoint_path):
         self.accelerator.load_state(checkpoint_path)
@@ -178,7 +193,7 @@ class HFAccelerator(TrainEngine):
 
     def clip_grad_norm_(self, model, max_norm):
         return self.accelerator.clip_grad_norm_(model.parameters(), max_norm)
-
+    
     def _rename_weight_keys(self, weights: Dict[str, torch.Tensor], model) -> Dict[str, torch.Tensor]:
         """Convert state dict keys for compatibility.
         
