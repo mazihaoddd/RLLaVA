@@ -2,7 +2,7 @@ import os
 import torch
 from torch import nn
 
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, Dataset
 
 from transformers import Trainer
 from transformers.trainer import (
@@ -119,8 +119,8 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        dataset = self.train_dataset
+    def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optional[torch.utils.data.Sampler]:
+        dataset = train_dataset if train_dataset is not None else self.train_dataset
         if dataset is None or not has_length(dataset):
             return None
 
@@ -134,7 +134,7 @@ class LLaVATrainer(Trainer):
                 group_by_modality=True,
             )
         else:
-            return super()._get_train_sampler()
+            return super()._get_train_sampler(train_dataset)
 
     def create_optimizer(self):
         """

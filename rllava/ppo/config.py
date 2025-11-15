@@ -66,7 +66,7 @@ class RewardConfig:
 
 @dataclass
 class CriticConfig:
-    strategy: str = "fsdp"
+    strategy: str = "fsdp2"
     ppo_mini_batch_size: int = 256
     """number of samples per minibatch for updating critic"""
     ppo_micro_batch_size: int = 4
@@ -118,7 +118,7 @@ class PolicyLossConfig:
 
 @dataclass
 class ActorConfig:
-    strategy: str = "fsdp"
+    strategy: str = "fsdp2"
     ppo_mini_batch_size: int = 256
     """number of samples per minibatch for updating actor"""
     ppo_micro_batch_size: int = 4

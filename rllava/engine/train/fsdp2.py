@@ -106,7 +106,6 @@ class FSDP2Accelerator(FSDPAccelerator):
             self.offload_fsdp_optimizer(optimizer)
 
     def _prepare_module(self, module: nn.Module, **kwargs: Any):
-        from torch.distributed.fsdp import MixedPrecision, CPUOffload
         from rllava.utils.torch_dtypes import PrecisionType
 
         self.wait_for_everyone()
@@ -122,8 +121,10 @@ class FSDP2Accelerator(FSDPAccelerator):
             reduce_dtype = torch.float32
 
         cpu_offload = None
-        if forward_only:
+        if forward_only or self.fsdp_config.offload_params:
             cpu_offload = CPUOffloadPolicy(pin_memory=True)
+            self.fsdp_config.offload_params = False
+            self.fsdp_config.offload_optimizer = False
 
         assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
         mp_policy = MixedPrecisionPolicy(

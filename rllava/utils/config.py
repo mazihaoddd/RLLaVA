@@ -183,7 +183,7 @@ class LLaVAModelConfig(ModelConfig):
     tune_type_vision_tower: str = field(default="frozen") # support only: frozen, full, partially-tune
     tune_vision_tower_from_layer: Optional[int] = field(default=10)
     tune_type_connector: str = field(default="full") # support only: frozen, full
-    tune_embed_tokens: Optional[int] = field(default=False)
+    tune_embed_tokens: bool = field(default=False)
     
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)

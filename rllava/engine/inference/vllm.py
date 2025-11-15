@@ -20,6 +20,7 @@ from rllava.utils import torch_functional as VF
 from rllava.utils.model_utils import print_gpu_memory_usage
 from rllava.utils.torch_dtypes import PrecisionType
 from rllava.utils.transformers_compat import is_transformers_version_in_range
+from rllava.utils.device import get_device_id
 from torch.distributed.tensor import DTensor
  
 if TYPE_CHECKING:
@@ -246,11 +247,11 @@ class VLLMEngine(InferenceEngine):
         
         print_gpu_memory_usage("Before vllm wake up in vllm engine")
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["weights"]) # +4.5G
+            self.inference_engine.wake_up(tags=["weights"])
         else:
             self.inference_engine.wake_up()
         
-        self.update_weights(model) # +4.9G
+        self.update_weights(model)
 
         print_gpu_memory_usage("After vllm wake up in vllm engine")
         
@@ -275,11 +276,12 @@ class VLLMEngine(InferenceEngine):
         Returns:
             Iterator over (name, tensor) pairs
         """
+        device = get_device_id() 
         for name in sorted(weights.keys()):
             tensor = weights[name]
             # Handle DTensor for distributed training
             if hasattr(tensor, 'full_tensor'):
-                yield name, tensor.full_tensor() if (self.world_size != 1 or isinstance(tensor, DTensor)) else tensor
+                yield name, tensor.to(device, non_blocking=True).full_tensor() if (self.world_size != 1 or isinstance(tensor, DTensor)) else tensor
             else:
                 yield name, tensor 
 

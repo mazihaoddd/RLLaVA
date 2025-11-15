@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, TYPE_CHECKING, Union, List
+from typing import Dict, Optional, Sequence, TYPE_CHECKING, Union, List, Any
 import transformers
 
 
@@ -35,7 +35,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None,
+    data_path: Optional[str] = field(default=None,
                            metadata={"help": "Path to the training data."})
     lazy_preprocess: bool = False
     is_multimodal: bool = True
@@ -70,7 +70,7 @@ class DataArguments:
         default="",
         metadata={"help": "the directory of image in the dataset"}
     )
-    image_size: str = field(
+    image_size: Optional[str] = field(
         default=None,
         metadata={"help": "the size of image in the dataset"}
     )
@@ -95,7 +95,7 @@ class TrainingArguments(transformers.TrainingArguments):
     tune_type_vision_tower: str = field(default="frozen") # support only: frozen, full, partially-tune
     tune_vision_tower_from_layer: Optional[int] = field(default=10)
     tune_type_connector: str = field(default="full") # support only: frozen, full
-    tune_embed_tokens: Optional[int] = field(default=False)
+    tune_embed_tokens: bool = field(default=False)
     
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
@@ -117,7 +117,7 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     lora_task_type: str = field(default="CAUSAL_LM")
     lora_r: int = field(default=128)
-    lora_target_modules: Optional[Union[List[str], str]] = field(
+    lora_target_modules: Union[List[str], str, None] = field(
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"],
     )
     lora_alpha: int = field(default=256)
@@ -235,7 +235,7 @@ class TrainingRLArguments(TrainingArguments):
             "out-of-memory (OOM) errors during initialization."
         },
     )
-    model_init_kwargs: Optional[dict] = field(
+    model_init_kwargs: Optional[Dict[str, Any]] = field(
         default=None,
         metadata={
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "

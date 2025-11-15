@@ -104,16 +104,16 @@ class RLHFDataset(Dataset):
                 self.format_prompt = f.read()
 
         if filter_overlong_prompts:
-            # self.dataset = self.dataset.filter(
-            #     self._filter_overlong_prompts,
-            #     desc="Filtering overlong prompts",
-            #     num_proc=filter_overlong_prompts_workers,
-            # )
             self.dataset = self.dataset.filter(
-                lambda doc: len(tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                self._filter_overlong_prompts,
+                desc="Filtering overlong prompts",
                 num_proc=filter_overlong_prompts_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
+            # self.dataset = self.dataset.filter(
+            #     lambda doc: len(tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+            #     num_proc=filter_overlong_prompts_workers,
+            #     desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+            # )
 
             print(f"filter dataset len: {len(self.dataset)}")
 

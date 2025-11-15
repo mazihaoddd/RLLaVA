@@ -104,6 +104,22 @@ install_with_mirror_fallback() {
     return 1
 }
 
+# Extract clean package name (without extras or version spec)
+get_package_name() {
+    local package=$1
+    echo "$package" | sed 's/[<>=!].*//' | cut -d'[' -f1
+}
+
+# Extract exact version if the requirement pins it via ==
+get_exact_version() {
+    local package=$1
+    if [[ "$package" == *"=="* ]]; then
+        echo "${package##*==}"
+    else
+        echo ""
+    fi
+}
+
 # Check Python version
 check_python_version() {
     print_info "Checking Python version..."
@@ -218,6 +234,10 @@ check_package_installed() {
     local package_name=$1
     local required_version=$2
     
+    if [ -z "$package_name" ] || [ -z "$required_version" ]; then
+        return 1
+    fi
+    
     # Extract package name without version
     local name=$(echo "$package_name" | cut -d'=' -f1)
     
@@ -307,10 +327,10 @@ install_basic_deps() {
     
     for package in "${basic_packages[@]}"; do
         current=$((current + 1))
-        local name=$(echo "$package" | cut -d'=' -f1)
-        local version=$(echo "$package" | cut -d'=' -f2)
+        local name=$(get_package_name "$package")
+        local version=$(get_exact_version "$package")
         
-        if [ "$FAST_MODE" = false ] && check_package_installed "$name" "$version"; then
+        if [ -n "$version" ] && [ "$FAST_MODE" = false ] && check_package_installed "$name" "$version"; then
             print_info "✓ [$current/$total] $package is already installed"
         else
             print_info "[$current/$total] Installing $package..."
@@ -334,10 +354,10 @@ install_compile_deps() {
     )
     
     for package in "${compile_packages[@]}"; do
-        local name=$(echo "$package" | cut -d'=' -f1)
-        local version=$(echo "$package" | cut -d'=' -f2)
+        local name=$(get_package_name "$package")
+        local version=$(get_exact_version "$package")
         
-        if check_package_installed "$name" "$version"; then
+        if [ -n "$version" ] && check_package_installed "$name" "$version"; then
             print_info "✓ $package is already installed"
         else
             print_info "Installing $package..."
@@ -433,10 +453,10 @@ install_optional_packages() {
     )
     
     for package in "${optional_packages[@]}"; do
-        local name=$(echo "$package" | cut -d'=' -f1)
-        local version=$(echo "$package" | cut -d'=' -f2)
+        local name=$(get_package_name "$package")
+        local version=$(get_exact_version "$package")
         
-        if check_package_installed "$name" "$version"; then
+        if [ -n "$version" ] && check_package_installed "$name" "$version"; then
             print_info "✓ $package is already installed"
         else
             print_info "Installing $package..."

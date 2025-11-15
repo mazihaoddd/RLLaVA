@@ -27,8 +27,8 @@ algorithm:
 
 actor:
   ppo_mini_batch_size: 4  
-  ppo_micro_batch_size: 1
-  log_prob_micro_batch_size: 2
+  ppo_micro_batch_size: 1  
+  log_prob_micro_batch_size: 2 
   max_grad_norm: 1.0
   padding_free: true
   dynamic_batching: true
@@ -45,7 +45,7 @@ actor:
     lr_warmup_ratio: 0.0
   fsdp:
     enable_cpu_offload: true
-    use_orig_params: true
+    use_orig_params: false
     offload_params: true  # true: more CPU memory; false: more GPU memory
     offload_optimizer: true  # true: more CPU memory; false: more GPU memory
 rollout:

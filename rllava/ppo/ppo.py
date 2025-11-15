@@ -75,10 +75,9 @@ class PPO():
                            processor=processor)
         self.critic = Critic(config.critic) if config.critic is not None else None
 
+        self.ref = None
         if config.algorithm.use_kl_loss or config.algorithm.use_kl_in_reward:
-            if self.actor.is_peft_model:
-                self.ref = None
-            else:
+            if not self.actor.is_peft_model:
                 self.ref = Ref(config.actor, tokenizer=tokenizer, processor=processor)
 
         self.reward = reward
@@ -108,6 +107,8 @@ class PPO():
     def initialize(self, train_dataloader):
         self.training_steps = self.get_training_steps(train_dataloader)
 
+        self.rollout.initialize(self.config.actor.model.model_path)
+
         self.config.actor.optim.training_steps = self.training_steps
         self.actor.initialize()
 
@@ -119,8 +120,6 @@ class PPO():
             self.ref.initialize(self.actor)
         
         self.reward.initialize()
-
-        self.rollout.initialize(self.config.actor.model.model_path)
 
     def get_training_steps(self, train_dataloader):  
         if self.config.trainer.max_steps is not None:
@@ -180,11 +179,13 @@ class PPO():
         yield
         self.rollout.rollout_engine.offload()
 
-    def compute_values(self, batch):
-        return self.critic.compute_values(batch)
+    def compute_values(self, data: DataProto):
+        self._process_multi_modal_inputs(data)
 
-    def compute_rewards(self, batch):
-        return self.reward.compute_rewards(batch)
+        return self.critic.compute_values(data)
+
+    def compute_rewards(self, data: DataProto):
+        return self.reward.compute_rewards(data)
 
     def compute_log_probs(self, data: DataProto):
         on_policy = len(data) // self.config.actor.ppo_mini_batch_size == 1 and self.config.actor.ppo_epochs == 1
@@ -257,6 +258,7 @@ class PPO():
         self._process_multi_modal_inputs(data)
 
         data.meta_info["use_kl_loss"] = self.config.algorithm.use_kl_loss
+        data.meta_info["temperature"] = self.config.rollout.temperature
         outputs = []
 
         if self.use_critic:
