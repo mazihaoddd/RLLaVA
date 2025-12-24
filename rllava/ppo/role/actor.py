@@ -259,25 +259,11 @@ class Actor(PolicyRole):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                grad_norm = self.accelerator.optimizer_step(self.model, self.optimizer)
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         self.optimizer.zero_grad()
         return metrics
-    
-    def _optimizer_step(self):
-        """Perform optimizer step with Accelerator support."""
-        grad_norm = self.accelerator.clip_grad_norm_(
-                        self.model, self.config.max_grad_norm
-                    )
-            
-        if not torch.isfinite(grad_norm):
-            print("Gradient norm is not finite. Skip update.")
-            self.optimizer.zero_grad()
-        else:
-            self.optimizer.step()
-
-        return grad_norm
 
 
 

@@ -54,6 +54,9 @@ class TrainEngine:
     
     def backward(self, loss):
         raise NotImplementedError("backward is not implemented")
+
+    def optimizer_step(self):
+        raise NotImplementedError("optimizer_step is not implemented")
     
     def clip_grad_norm_(self, model, max_norm):
         raise NotImplementedError("clip_grad_norm_ is not implemented")

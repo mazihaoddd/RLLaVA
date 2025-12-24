@@ -253,6 +253,20 @@ class FSDPAccelerator(TrainEngine):
     def get_fsdp_state_ctx(self, model, state_type, state_cfg, optim_cfg):
         return FSDP.state_dict_type(model, state_type, state_cfg, optim_cfg)
 
+    def optimizer_step(self, model: FSDP, optimizer: Optimizer):
+        """Perform optimizer step with Accelerator support."""
+        grad_norm = self.clip_grad_norm_(
+                        model, self.config.max_grad_norm
+                    )
+            
+        if not torch.isfinite(grad_norm):
+            print("Gradient norm is not finite. Skip update.")
+            optimizer.zero_grad()
+        else:
+            optimizer.step()
+
+        return grad_norm
+
     def clip_grad_norm_(self, model: FSDP, max_norm: float):
         grad_norm = model.clip_grad_norm_(max_norm)
 

@@ -515,17 +515,17 @@ install_optional_core_packages() {
 }
 
 install_deepspeed_package() {
-    if check_package_installed "deepspeed" "0.15.4"; then
-        print_info "✓ deepspeed==0.15.4 is already installed"
+    if check_package_installed "deepspeed" "0.18.3"; then
+        print_info "✓ deepspeed==0.18.3 is already installed"
         return
     fi
 
     print_info "Installing DeepSpeed..."
     if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
         print_info "Using CUDA_HOME: $CUDA_HOME"
-        if ! CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4"; then
+        if ! CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.18.3"; then
             print_warning "DeepSpeed installation failed, trying with no-build-isolation..."
-            if ! CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4" "--no-build-isolation"; then
+            if ! CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.18.3" "--no-build-isolation"; then
                 print_warning "DeepSpeed installation failed, skipping..."
             fi
         fi
@@ -533,7 +533,7 @@ install_deepspeed_package() {
         print_warning "CUDA_HOME not properly configured, skipping DeepSpeed installation"
         print_info "To install DeepSpeed manually:"
         echo "  export CUDA_HOME=/path/to/cuda"
-        echo "  pip install deepspeed==0.15.4"
+        echo "  pip install deepspeed==0.18.3"
     fi
 }
 

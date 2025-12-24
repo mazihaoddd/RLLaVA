@@ -81,12 +81,12 @@ We support a broad family of RL methods, enabled by simple config switches:
 - GRPO, RLOO, REINFORCE++, OPO, REMAX, GPG, PPO, DAPO, GMPO, GSPO, DR-GRPO, CLIP-COV, KL-COV
 
 **Models:**
-- Qwen2-VL and Qwen2.5-VL (2B, 3B, 7B variants) for vision-language tasks
+- Qwen2-VL/Qwen2.5-VL/Qwen3-VL vision language models
 - TinyLLaVA-style architectures with customizable vision encoders, connectors, and LLMs
 - Support for LLMs (e.g., Qwen3, LLaMA) in text-only RL scenarios
 
 **Backends:**
-- **Training**: FSDP, FSDP2
+- **Training**: FSDP, FSDP2，DeepSpeed
 - **Inference**: vLLM, HuggingFace
 
 

@@ -154,7 +154,7 @@ class VLLMEngine(InferenceEngine):
 
     def generate(self, prompts: DataProto) -> DataProto:
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["kv_cache"]) # +10.5G
+            self.inference_engine.wake_up(tags=["kv_cache"]) 
 
         # left-padded attention_mask
         input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)

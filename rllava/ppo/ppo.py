@@ -315,6 +315,10 @@ class PPO():
                     else:
                         multi_modal_inputs = {}
 
+                    for key in multi_modal_inputs:
+                        if isinstance(multi_modal_inputs[key], torch.Tensor):
+                            multi_modal_inputs[key] = multi_modal_inputs[key].to(data.batch["input_ids"].device)
+
                     multi_modal_inputs_cache[index] = multi_modal_inputs
 
                 batch_multi_modal_inputs.append(multi_modal_inputs_cache[index])

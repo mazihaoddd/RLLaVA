@@ -133,7 +133,10 @@ class FSDPConfig:
 @dataclass
 class DeepSpeedConfig:
     zero_stage: int = 3
-    enable_full_shard: bool = True
-    enable_cpu_offload: bool = False
-    use_orig_params: bool = False
-    torch_dtype: Optional[str] = None
+    enable_cpu_offload: bool = True
+    torch_dtype: str = "bf16"
+    contiguous_gradients: bool = True
+    overlap_comm: bool = True
+    reduce_scatter: bool = True
+    stage3_prefetch_bucket_size: float = 1e8
+    stage3_param_persistence_threshold: float = 1e5
