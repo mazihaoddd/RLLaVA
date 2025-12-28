@@ -1,8 +1,16 @@
 <div align="center">
   <img src="assets/icon.png" alt="RLLaVA Icon" width="200">
 </div>
+  
+# RLLaVA: An RL-central Framework for Language and Vision Assistants 🚀
 
-# RLLaVA: An RL-central Framework for Language and Vision Assistant 🚀
+<p align="center">
+🤗 <a href="https://huggingface.co/collections/mzh12345/rllava" target="_blank">Models(RLLaVA)</a>
+<p align="center">
+
+<h5 align="center"> If you like our project, please send us a star ⭐ on GitHub.</h5>
+
+## ✨ What's RLLaVA?
 
 RLLaVA is a user-friendly framework for multi-modal RL. It features an **RL-central** design that decouples algorithm logic from distributed execution, enables modular customization of algorithms, models, and engines, and is optimized for resource-constrained setups to make advanced RL research more accessible.
 
@@ -11,7 +19,7 @@ RLLaVA is a user-friendly framework for multi-modal RL. It features an **RL-cent
 </div>
 
 ---
-
+  
 ## ✨ Why RLLaVA?
 
 - **🎯 RL-Centric**: Implements an algorithm-driven approach tailored for RL, decoupling logic from distributed execution so researchers can focus on innovation without distributed system complexities.
@@ -105,7 +113,7 @@ Our RL algorithms and distributed training implementation draw inspiration from 
 
 ```bibtex
 @misc{zhao2025rllava,
-  title        = {RLLaVA: An RL-central Framework for Language and Vision Assistant},
+  title        = {RLLaVA: An RL-central Framework for Language and Vision Assistants},
   author       = {Lei Zhao, Zihao Ma, Boyu Lin, Yuhe Liu, Wenjun Wu, Lei Huang},
   howpublished = {\url{https://github.com/TinyLoopX/RLLaVA}},
   year         = {2025}
