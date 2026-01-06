@@ -1,573 +1,630 @@
-from __future__ import annotations
-
-import logging
 import os
-from copy import deepcopy
-from dataclasses import asdict
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from urllib.parse import urljoin, urlparse
-
-import numpy as np
+import time
+import json
+import socket
+import asyncio
 import requests
+import aiohttp
 import torch
+import multiprocessing
+import torch.distributed as dist
+from datetime import timedelta
+from collections import defaultdict
+from typing import (
+    Tuple,
+    Literal,
+    Optional,
+    TYPE_CHECKING,
+    Dict,
+    Any,
+    List,
+    Sequence,
+)
+
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.entrypoints.http_server_engine import launch_server_process
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils import  MultiprocessingSerializer
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+from torch.distributed.tensor import DTensor, Replicate
+from sglang_router.launch_router import RouterArgs, launch_router
 from tensordict import TensorDict
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
-from .base import InferenceEngine
 from .. import register_engine
+from .base import InferenceEngine, _repeat_interleave, _process_multi_modal_data
 from rllava.data.protocol import DataProto
 from rllava.utils import torch_functional as VF
-# from .remote_utils import ServiceProcess, ensure_port, find_free_port
-from .config import SGLangConfig
-try:
-    import sglang as sgl
-except Exception:
-    sgl = None
+from rllava.utils.model_utils import print_gpu_memory_usage
+from rllava.utils.transformers_compat import is_transformers_version_in_range
+from rllava.utils.dist_utils import is_rank0, broadcast_object, gather_and_concat_list
+from rllava.utils.device import get_device_id
+from rllava.data.data_utils import image2base64
+
+
+
+
+class _SyncGenerateAdapter:
+    """Simple synchronous adapter that issues blocking HTTP requests."""
+
+    def __init__(self, router_url: str):
+        self.router_url = router_url
+
+    def generate(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        response = sync_request(self.router_url, "generate", json=payload, retry_delay=10)
+        if isinstance(response, list):
+            return response
+        return [response]
+
+
+class _AsyncGenerateAdapter:
+    """Adapter that issues concurrent HTTP requests via aiohttp."""
+
+    def __init__(self, router_url: str, max_trials: int = 3, retry_delay: float = 1.0):
+        self.router_url = router_url
+        self.max_trials = max_trials
+        self.retry_delay = retry_delay
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _ensure_session(self):
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=None)
+            connector = aiohttp.TCPConnector(limit=0)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def _post(self, endpoint: str, payload: Dict[str, Any]) -> Any:
+        await self._ensure_session()
+        assert self._session is not None
+        url = f"{self.router_url}/{endpoint}"
+
+        for trial in range(self.max_trials):
+            try:
+                async with self._session.post(url, json=payload) as response:
+                    response.raise_for_status()
+                    try:
+                        return await response.json(content_type=None)
+                    except json.decoder.JSONDecodeError:
+                        return await response.text()
+            except Exception:
+                if trial == self.max_trials - 1:
+                    raise
+                await asyncio.sleep(self.retry_delay)
+
+    async def generate_batch(self, payloads: List[Dict[str, Any]]) -> List[Any]:
+        tasks = [self._post("generate", payload) for payload in payloads]
+        return await asyncio.gather(*tasks)
+
+
+
+if TYPE_CHECKING:
+    from rllava.ppo.config import RolloutConfig
+
+
+PROCESSES = []
 
 
 @register_engine("sglang")
 class SGLangEngine(InferenceEngine):
-    """High-level rollout engine powered by SGLang."""
 
     def __init__(
         self,
         model_name_or_path: str,
-        config: "RolloutConfig",
+        config: 'RolloutConfig',
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
-        engine_args: Optional[Dict] = None,
-    ) -> None:
+    ):
         super().__init__(model_name_or_path, config, tokenizer, processor)
-        self.engine_args = engine_args or {}
 
-        self._engine = None
-        self._logger = logging.getLogger(__file__)
-        self._version = 0
-        self._workflow_executor = None
-        self._engine_id: Optional[str] = None
-        self._loaded = False
-        self._service_process: Optional[ServiceProcess] = None
-        self._service_base_url: Optional[str] = None
-        self._service_session: Optional[requests.Session] = None
-        self._service_generate_endpoint: Optional[str] = None
-        self._service_timeout = config.service_timeout
-        self._service_headers: Dict[str, str] = {}
-        self.service_mode = config.service_mode
+        self.gloo_group = dist.new_group(
+            ranks=list(range(self.world_size)),
+            timeout=timedelta(seconds=36000),
+            backend="gloo"
+        )
 
-        if self.service_mode:
-            self._initialize_remote_service(model_name_or_path)
-        else:
-            self._ensure_backend_available()
+        self.device_mesh = dist.device_mesh.init_device_mesh(
+            "cpu",
+            mesh_dim_names=("dp", "tp"),
+            mesh_shape=(self.world_size // self.tp_size, self.tp_size)
+        )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _ensure_backend_available(self) -> None:
-        if sgl is None:
-            raise RuntimeError(
-                "SGLang is not installed or failed to import. "
-                "Please ensure `sglang>=0.4.9.post2` is available before using the SGLang inference engine."
-            )
+        self._prepare_environment_variables()
+        
+        self._sync_adapter: Optional[_SyncGenerateAdapter] = None
+        self._async_adapter: Optional[_AsyncGenerateAdapter] = None
 
-    def _build_engine_kwargs(self) -> Dict:
-        """Merge config-driven runtime arguments with user overrides."""
-        cfg_dict = asdict(self.config.sglang) if hasattr(self.config, "sglang") else {}
-        if cfg_dict.get("model_path") in (None, ""):
-            cfg_dict["model_path"] = self.model
-        cfg_dict = {k: v for k, v in cfg_dict.items() if v is not None}
-        merged = {**cfg_dict, **self.engine_args}
-        return merged
+        if self.device_mesh["tp"].get_local_rank() == 0:
+            self._launch_server()
+            # self._sleep()
+        self.loaded = False
 
-    def _create_engine(self) -> "sgl.Engine":  # type: ignore[name-defined]
-        engine_kwargs = self._build_engine_kwargs()
-        self._logger.info("Initializing SGLang engine with args: %s", {k: engine_kwargs[k] for k in sorted(engine_kwargs)})
-        try:
-            return sgl.Engine(**engine_kwargs)
-        except Exception as exc:  # pragma: no cover - pass-through to caller with context
-            self._logger.exception("Failed to initialize SGLang engine", exc_info=exc)
-            raise
+        dist.barrier(self.gloo_group)
+    
+        if is_rank0():
+            self._launch_router()
 
-    def _initialize_remote_service(self, model_name_or_path: str) -> None:
-        service_cfg = deepcopy(self.config.service)
+        self.router_url = broadcast_object(
+            self.router_url if dist.get_rank() == 0 else None,
+            process_group=self.device_mesh["dp"].get_group(),
+            group_src=0
+        )
+        # Default adapters
+        self._sync_adapter = _SyncGenerateAdapter(self.router_url)
+        self._async_adapter = _AsyncGenerateAdapter(self.router_url)
 
-        host = service_cfg.host or "127.0.0.1"
-        address: Optional[str] = None
-
-        if self.config.service_url:
-            base_url = self._normalize_service_url(self.config.service_url)
-            self._service_base_url = base_url.rstrip("/")
-            parsed = urlparse(self._service_base_url)
-            address = parsed.netloc or parsed.path
-            if address:
-                self.wait_for_server(address)
-        else:
-            port = ensure_port(service_cfg.port, host=host)
-            address = f"{host}:{port}"
-
-        should_launch_service = (self.rank == 0)
-
-        if self.config.service_url or service_cfg.reuse_existing:
-            if address:
-                self.wait_for_server(address)
-            if self._service_base_url is None and address:
-                self._service_base_url = f"http://{address}"
-        else:
-            if should_launch_service:
-                dist_addr = service_cfg.dist_init_addr or f"{host}:{find_free_port(host=host)}"
-                sglang_cfg = deepcopy(self.config.sglang)
-                if not sglang_cfg.model_path:
-                    sglang_cfg.model_path = model_name_or_path
-
-                cmd = SGLangConfig.build_cmd(
-                    sglang_config=sglang_cfg,
-                    tp_size=self.config.tensor_parallel_size,
-                    base_gpu_id=0,
-                    host=host,
-                    port=port,
-                    dist_init_addr=dist_addr,
-                )
-                cmd = cmd.replace("\\\n", " ").replace("\\", " ")
-
-                env = deepcopy(service_cfg.env) if service_cfg.env else {}
-                if "CUDA_VISIBLE_DEVICES" not in env:
-                    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-                log_path = service_cfg.log_path or os.path.join(os.getcwd(), "logs", "sglang_service.log")
-
-                self._service_process = ServiceProcess(
-                    command=cmd,
-                    env=env,
-                    log_path=log_path,
-                ).start()
-
-            if address:
-                self.wait_for_server(address)
-            self._service_base_url = f"http://{address}"
-
-        if self._service_base_url is None:
-            raise RuntimeError("Failed to determine remote service base URL for SGLangEngine.")
-
-        self._service_session = requests.Session()
-        self._service_headers = {"Content-Type": "application/json"}
-        self._service_session.headers.update(self._service_headers)
-        self._service_generate_endpoint = urljoin(self._service_base_url + "/", "generate")
-        self.config.service_url = self._service_base_url
-
-    def _normalize_service_url(self, url: str) -> str:
-        if not url:
-            raise ValueError("Empty service URL provided.")
-        normalized = url.strip()
-        if not normalized.startswith("http://") and not normalized.startswith("https://"):
-            normalized = f"http://{normalized}"
-        parsed = urlparse(normalized)
-        if not parsed.netloc:
-            raise ValueError(f"Invalid service URL: {url}")
-        return normalized
-
-    def _prepare_sampling_params(self, meta_info: Dict[str, float | int | bool]) -> Dict:
-        """Build request-level sampling params using rollout defaults plus overrides from meta_info."""
+    def _build_sampling_params(self, meta_info: Dict[str, Any]) -> Dict[str, Any]:
         params = {
-            "n": 1,
             "temperature": meta_info.get("temperature", self.config.temperature),
-            "top_p": meta_info.get("top_p", getattr(self.config, "top_p", 1.0)),
-            "top_k": meta_info.get("top_k", getattr(self.config, "top_k", -1)),
+            "top_p": meta_info.get("top_p", self.config.top_p),
+            "top_k": meta_info.get("top_k", self.config.top_k),
+            "repetition_penalty": meta_info.get("repetition_penalty"),
             "max_new_tokens": meta_info.get("max_new_tokens", self.config.response_length),
-            "presence_penalty": meta_info.get("presence_penalty", 0.0),
-            "frequency_penalty": meta_info.get("frequency_penalty", 0.0),
+            "stop": meta_info.get("stop"),
             "ignore_eos": meta_info.get("ignore_eos", self.config.ignore_eos),
         }
-        if params["temperature"] == 0:
-            params.update({
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
-            })
-        return params
+        return {k: v for k, v in params.items() if v is not None}
 
-    def _ensure_raw_prompt_ids(self, prompts: DataProto) -> np.ndarray:
-        """Ensure `raw_prompt_ids` exist in non-tensor batch, deriving from input_ids if necessary."""
+    def _prepare_batch(self, prompts: DataProto) -> List[Dict[str, Any]]:
         non_tensor_batch = prompts.non_tensor_batch
-        if "raw_prompt_ids" in non_tensor_batch:
-            return non_tensor_batch["raw_prompt_ids"]
+        batch_raw_prompt_ids = non_tensor_batch.get("raw_prompt_ids")
+        batch_multi_modal_data = non_tensor_batch.get("multi_modal_data", None)
+        sampling_params = self._build_sampling_params(prompts.meta_info)
+        print(f"SGLang Sampling params: {sampling_params}")
 
-        input_ids: torch.Tensor = prompts.batch["input_ids"].to("cpu")
-        attention_mask: torch.Tensor = prompts.batch["attention_mask"].to("cpu")
-        pad_token_id = prompts.meta_info.get("pad_token_id", self.pad_token_id)
-        raw_prompt_ids = []
-        for seq, mask in zip(input_ids, attention_mask, strict=True):
-            valid_length = int(mask.sum().item())
-            tokens = seq[-valid_length:].tolist()
-            if pad_token_id is not None:
-                tokens = [tid for tid in tokens if tid != pad_token_id]
-            raw_prompt_ids.append(tokens)
-        raw_prompt_ids = np.array(raw_prompt_ids, dtype=object)
-        non_tensor_batch["raw_prompt_ids"] = raw_prompt_ids
-        return raw_prompt_ids
-
-    def _prepare_multi_modal_entries(self, prompts: DataProto, batch_size: int) -> Optional[np.ndarray]:
-        non_tensor_batch = prompts.non_tensor_batch
-        if "multi_modal_data" in non_tensor_batch:
-            return non_tensor_batch["multi_modal_data"]
-        if self.processor is None:
-            return None
-        if "multi_modal_inputs" not in non_tensor_batch:
-            return None
-
-        mm_array = np.array(non_tensor_batch["multi_modal_inputs"], dtype=object)
-        non_tensor_batch["multi_modal_data"] = mm_array
-        return mm_array
-
-    def _build_request_payloads(self, prompts: DataProto) -> List[Dict]:
-        """Convert `DataProto` prompts into SGLang request payloads."""
-        batch_size = len(prompts)
-        raw_prompt_ids = self._ensure_raw_prompt_ids(prompts)
-        multi_modal_entries = self._prepare_multi_modal_entries(prompts, batch_size)
-        agent_names = prompts.non_tensor_batch.get("agent_name")
-        tools_kwargs = prompts.non_tensor_batch.get("tools_kwargs")
-        payloads: List[Dict] = []
-        for idx in range(batch_size):
-            payload: Dict = {"prompt_token_ids": list(map(int, raw_prompt_ids[idx]))}
-            if multi_modal_entries is not None:
-                payload["multi_modal_data"] = multi_modal_entries[idx]
-            if agent_names is not None:
-                payload["agent_name"] = agent_names[idx]
-            if tools_kwargs is not None:
-                payload["tools_kwargs"] = tools_kwargs[idx]
-            payloads.append(payload)
-        return payloads
-
-    def _post_remote(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if self._service_session is None or self._service_generate_endpoint is None:
-            raise RuntimeError("Remote SGLang service endpoint not initialized.")
-        response = self._service_session.post(
-            self._service_generate_endpoint,
-            json=payload,
-            timeout=self._service_timeout,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    # ------------------------------------------------------------------
-    # Lifecycle management
-    # ------------------------------------------------------------------
-    def initialize(self, engine_id: Optional[str] = None) -> None:
-        if self._engine is not None:
-            self._logger.debug("SGLang engine already initialized; skipping re-init.")
-            return
-
-        self._ensure_backend_available()
-        self._engine_id = engine_id or "sglang"
-        self._logger = logging.getLogger(f"rllava.sglang.engine[{self._engine_id}]")
-        self._engine = self._create_engine()
-        self._logger.info("SGLang engine initialized.")
-
-    def destroy(self) -> None:
-        if self._engine is None:
-            return
-        try:
-            shutdown = getattr(self._engine, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
-        finally:
-            self._engine = None
-            self._logger.info("SGLang engine destroyed.")
-
-    def load(self, model) -> None:
-        if self.service_mode:
-            if self._service_base_url is None:
-                raise RuntimeError("Remote service base URL not initialized for SGLangEngine.")
-            parsed = urlparse(self._service_base_url)
-            address = parsed.netloc or parsed.path
-            if address:
-                self.wait_for_server(address)
-            self._loaded = True
-            return
-
-        if not self.is_initialized:
-            self.initialize()
-
-        if self._loaded:
-            self._logger.debug("SGLang engine already loaded; skipping.")
-            return
-
-        self._logger.warning(
-            "SGLangEngine.load currently acts as a no-op. Ensure remote weights"
-            " are refreshed through external mechanisms if required."
-        )
-        self._loaded = True
-
-    def offload(self) -> None:
-        if self.service_mode:
-            if self._service_session is not None:
-                self._service_session.close()
-                self._service_session = None
-            if self._service_process is not None:
-                self._service_process.terminate()
-                self._service_process = None
-            self._loaded = False
-            return
-
-        if not self._loaded:
-            return
-        self._logger.debug("SGLang engine offload (no-op).")
-        self._loaded = False
-
-    def update_weights(self, model) -> None:
-        # Placeholder until SGLang weight API is integrated.
-        self._logger.warning(
-            "SGLangEngine.update_weights is currently a stub."
-        )
-
-    def set_version(self, version: int) -> None:
-        self._version = version
-
-    def get_version(self) -> int:
-        return self._version
-
-    @property
-    def is_initialized(self) -> bool:
-        return self._engine is not None
-
-    # ------------------------------------------------------------------
-    # Generation interfaces
-    # ------------------------------------------------------------------
-    def generate(self, prompts: DataProto) -> DataProto:
-        if self.service_mode:
-            return self._generate_remote(prompts)
-
-        if not self.is_initialized:
-            self.initialize()
-
-        input_ids: torch.Tensor = prompts.batch["input_ids"]
-        attention_mask: torch.Tensor = prompts.batch["attention_mask"]
-        position_ids: torch.Tensor = prompts.batch["position_ids"]
-        eos_token_id: int = prompts.meta_info.get("eos_token_id", self.tokenizer.eos_token_id)
-
-        sampling_params_dict = self._prepare_sampling_params(prompts.meta_info)
-
-        payloads = self._build_request_payloads(prompts)
-
-        responses = [
-            self._engine.generate(
-                sampling_params=sampling_params_dict,
-                input_ids=payload.get("prompt_token_ids"),
-                image_data=payload.get("multi_modal_data"),
-                return_logprob=True,
-            )
-            for payload in payloads
-        ]
-
-        response_ids_list: List[List[int]] = []
-        response_logprobs_list: List[List[float]] = []
-        stop_reasons: List[str] = []
-
-        for result in responses:
-            meta_info = result.get("meta_info", {})
-            token_entries = meta_info.get("output_token_logprobs", [])
-
-            tokens: List[int] = []
-            logprobs: List[float] = []
-            for entry in token_entries:
-                if isinstance(entry, dict):
-                    token_value = entry.get("token_id") or entry.get("token") or entry.get("value")
-                    logprob_value = entry.get("logprob") or entry.get("score") or entry.get("log_prob")
-                else:
-                    token_value = entry[1] if len(entry) > 1 else None
-                    logprob_value = entry[0]
-                if token_value is None:
-                    continue
-                tokens.append(int(token_value))
-                logprobs.append(float(logprob_value) if logprob_value is not None else 0.0)
-
-            response_ids_list.append(tokens)
-            response_logprobs_list.append(logprobs)
-
-            finish_reason = meta_info.get("finish_reason", {})
-            stop_reasons.append(finish_reason.get("type", finish_reason or "length"))
-
-        max_response_len = self.config.response_length
-        pad_token_id = self.pad_token_id if self.pad_token_id is not None else self.tokenizer.pad_token_id
-
-        def _pad_sequence(seq: List[int], pad_value: int) -> List[int]:
-            truncated = seq[:max_response_len]
-            padding = [pad_value] * (max_response_len - len(truncated))
-            return truncated + padding
-
-        def _pad_logprobs(seq: List[float]) -> List[float]:
-            truncated = seq[:max_response_len]
-            padding = [0.0] * (max_response_len - len(truncated))
-            return truncated + padding
-
-        padded_responses = [_pad_sequence(tokens, pad_token_id) for tokens in response_ids_list]
-        padded_logprobs = [_pad_logprobs(logprobs) for logprobs in response_logprobs_list]
-
-        responses_tensor = torch.tensor(padded_responses, dtype=input_ids.dtype, device=input_ids.device)
-        logprobs_tensor = torch.tensor(padded_logprobs, dtype=torch.float32, device=input_ids.device)
-
-        sequence_ids = torch.cat([input_ids, responses_tensor], dim=-1)
-        response_len = responses_tensor.size(1)
-
-        delta_position_id = torch.arange(1, response_len + 1, device=position_ids.device)
-        if position_ids.dim() == 3:
-            delta_position_id = delta_position_id.view(1, 1, -1).expand(position_ids.size(0), position_ids.size(1), -1)
-        else:
-            delta_position_id = delta_position_id.view(1, -1).expand(position_ids.size(0), -1)
-
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-
-        response_mask = VF.get_response_mask(response_ids=responses_tensor, eos_token_id=eos_token_id, dtype=attention_mask.dtype)
-        attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
-
-        batch = {
-            "prompts": input_ids,
-            "responses": responses_tensor,
-            "input_ids": sequence_ids,
-            "attention_mask": attention_mask,
-            "response_mask": response_mask,
-            "position_ids": position_ids,
-            "response_logprobs": logprobs_tensor,
-        }
-
-        stop_reasons_np = np.array(stop_reasons, dtype=object)
-        non_tensor_batch = {"stop_reasons": stop_reasons_np}
-
-        if "multi_modal_data" in prompts.non_tensor_batch:
-            non_tensor_batch["multi_modal_data"] = prompts.non_tensor_batch["multi_modal_data"]
-
-        meta_info = dict(prompts.meta_info)
-        meta_info["stop_reasons"] = stop_reasons
-
-        batch_collated = TensorDict(batch, batch_size=responses_tensor.size(0))
-
-        return DataProto(
-            batch=batch_collated,
-            non_tensor_batch=non_tensor_batch,
-            meta_info=meta_info,
-        )
-
-    def _generate_remote(self, prompts: DataProto) -> DataProto:
-        if self._service_session is None or self._service_base_url is None:
-            raise RuntimeError("Remote SGLang service session not initialized.")
-
-        input_ids: torch.Tensor = prompts.batch["input_ids"]
-        attention_mask: torch.Tensor = prompts.batch["attention_mask"]
-        position_ids: torch.Tensor = prompts.batch["position_ids"]
-        eos_token_id: int = prompts.meta_info.get("eos_token_id", self.tokenizer.eos_token_id)
-        batch_size = input_ids.size(0)
-
-        payloads = self._build_request_payloads(prompts)
-        sampling_params_dict = self._prepare_sampling_params(prompts.meta_info)
-
-        responses: List[Dict[str, Any]] = []
-        for payload in payloads:
-            data = {
-                "sampling_params": sampling_params_dict,
-                "input_ids": payload.get("prompt_token_ids"),
-                "image_data": payload.get("multi_modal_data"),
-                "return_logprob": True,
+        engine_inputs = []
+        for idx, raw_prompt_ids in enumerate(batch_raw_prompt_ids):
+            payload = {
+                "input_ids": list(raw_prompt_ids),
+                "sampling_params": {**sampling_params},
+                "return_logprob": prompts.meta_info.get("return_logprob", False),
             }
-            result = self._post_remote(data)
-            responses.append(result)
+            if batch_multi_modal_data is not None:
+                processed_images = _process_multi_modal_data(
+                    batch_multi_modal_data[idx],
+                    prompts.meta_info["min_pixels"],
+                    prompts.meta_info["max_pixels"],
+                    prompts.meta_info["video_fps"],
+                    self.processor,
+                )['image']
+                payload["image_data"] = image2base64(processed_images)
 
-        response_ids_list: List[List[int]] = []
-        response_logprobs_list: List[List[float]] = []
-        stop_reasons: List[str] = []
+            engine_inputs.append(payload)
 
-        for result in responses:
-            meta_info = result.get("meta_info", {})
-            token_entries = meta_info.get("output_token_logprobs", [])
+        return engine_inputs
 
-            tokens: List[int] = []
-            logprobs: List[float] = []
-            for entry in token_entries:
-                if isinstance(entry, dict):
-                    token_value = entry.get("token_id") or entry.get("token") or entry.get("value")
-                    logprob_value = entry.get("logprob") or entry.get("score") or entry.get("log_prob")
-                else:
-                    token_value = entry[1] if len(entry) > 1 else None
-                    logprob_value = entry[0]
-                if token_value is None:
-                    continue
-                tokens.append(int(token_value))
-                logprobs.append(float(logprob_value) if logprob_value is not None else 0.0)
+    @staticmethod
+    def _find_subsequence(sequence: Sequence[int], subsequence: Sequence[int]) -> int:
+        if not subsequence:
+            return 0
+        needle = list(subsequence)
+        limit = len(sequence) - len(needle) + 1
+        for idx in range(limit):
+            if sequence[idx : idx + len(needle)] == needle:
+                return idx
+        return -1
 
-            response_ids_list.append(tokens)
-            response_logprobs_list.append(logprobs)
+    def _finalize_batch(self, prompts: DataProto, response_ids: List[List[int]]) -> DataProto:
+        response_ids = VF.pad_2d_list_to_length(
+            response_ids, self.pad_token_id, max_length=self.config.response_length
+        ).to(prompts.batch["input_ids"].device)
 
-            finish_reason = meta_info.get("finish_reason", {})
-            stop_reasons.append(finish_reason.get("type", finish_reason or "length"))
+        batch_size = len(response_ids)
+        input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)
+        attention_mask: torch.Tensor = prompts.batch["attention_mask"]
+        position_ids: torch.Tensor = prompts.batch["position_ids"]
+        batch_multi_modal_data = prompts.non_tensor_batch.pop("multi_modal_data", None)
+        eos_token_id: int = prompts.meta_info["eos_token_id"]
 
-        max_response_len = self.config.response_length
-        pad_token_id = self.pad_token_id if self.pad_token_id is not None else self.tokenizer.pad_token_id
-
-        padded_responses = [
-            (tokens[:max_response_len] + [pad_token_id] * (max_response_len - len(tokens)))
-            for tokens in response_ids_list
-        ]
-        padded_logprobs = [
-            (logprobs[:max_response_len] + [0.0] * (max_response_len - len(logprobs)))
-            for logprobs in response_logprobs_list
-        ]
-
-        responses_tensor = torch.tensor(padded_responses, dtype=input_ids.dtype, device=input_ids.device)
-        logprobs_tensor = torch.tensor(padded_logprobs, dtype=torch.float32, device=input_ids.device)
-
-        sequence_ids = torch.cat([input_ids, responses_tensor], dim=-1)
-        response_len = responses_tensor.size(1)
-
-        delta_position_id = torch.arange(1, response_len + 1, device=position_ids.device)
-        if position_ids.dim() == 3:
-            delta_position_id = delta_position_id.view(1, 1, -1).expand(position_ids.size(0), position_ids.size(1), -1)
-        else:
-            delta_position_id = delta_position_id.view(1, -1).expand(position_ids.size(0), -1)
+        sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
+        response_length = response_ids.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.view(1, -1).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
 
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-
-        response_mask = VF.get_response_mask(response_ids=responses_tensor, eos_token_id=eos_token_id, dtype=attention_mask.dtype)
+        response_mask = VF.get_response_mask(
+            response_ids=response_ids, eos_token_id=eos_token_id, dtype=attention_mask.dtype
+        )
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
-        batch = {
-            "prompts": input_ids,
-            "responses": responses_tensor,
-            "input_ids": sequence_ids,
-            "attention_mask": attention_mask,
-            "response_mask": response_mask,
-            "position_ids": position_ids,
-            "response_logprobs": logprobs_tensor,
-        }
+        batch = TensorDict(
+            {
+                "prompts": input_ids,
+                "responses": response_ids,
+                "input_ids": sequence_ids,
+                "attention_mask": attention_mask,
+                "response_mask": response_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+        if batch_multi_modal_data is not None:
+            non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
+        else:
+            non_tensor_batch = {}
 
-        stop_reasons_np = np.array(stop_reasons, dtype=object)
-        non_tensor_batch = {"stop_reasons": stop_reasons_np}
-        multi_modal_data = prompts.non_tensor_batch.get("multi_modal_data")
-        if multi_modal_data is not None:
-            non_tensor_batch["multi_modal_data"] = multi_modal_data
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
 
-        meta_info = dict(prompts.meta_info)
-        meta_info["stop_reasons"] = stop_reasons
+    def generate(self, prompts: DataProto) -> DataProto:
+        num_return_sequences = prompts.meta_info.get("n", getattr(self.config, "n", 1))
+        if num_return_sequences > 1:
+            prompts = prompts.repeat(repeat_times=num_return_sequences, interleave=True)
 
-        batch_collated = TensorDict(batch, batch_size=responses_tensor.size(0))
+        prepared = self._prepare_batch(prompts)
+        responses = self._collect_sync(prepared)
+        return self._finalize_batch(prompts, responses)
 
-        return DataProto(
-            batch=batch_collated,
-            non_tensor_batch=non_tensor_batch,
-            meta_info=meta_info,
+    async def agenerate(self, prompts: DataProto) -> DataProto:
+        prepared = self._prepare_batch(prompts)
+        responses = await self._collect_async(prepared)
+        return self._finalize_batch(prompts, responses)
+
+    def update_weights(self, model):
+        weights = model.state_dict()
+        if is_transformers_version_in_range(min_version="4.54.0"):
+            weights = self._rename_weight_keys(weights, model)
+
+        device = get_device_id() 
+        dtype_to_named_tensors = defaultdict(list)
+        bucket_size = 0
+        for name in sorted(weights.keys()):
+            tensor = weights[name]
+            param_size = tensor.numel() * tensor.element_size()
+
+            if bucket_size > 0 and bucket_size + param_size > (self.config.bucket_size << 20):
+                self._update_tensor_bucket(dtype_to_named_tensors)
+                dtype_to_named_tensors = defaultdict(list)
+                bucket_size = 0
+            
+            tensor = tensor.to(device, non_blocking=True).detach()
+            if isinstance(tensor, DTensor):
+                # async version of `tensor.full_tensor()`
+                tensor = tensor.redistribute(
+                    placements=[Replicate()] * tensor.device_mesh.ndim,
+                    async_op=True
+                ).to_local()
+
+            dtype_to_named_tensors[tensor.dtype].append((name, tensor))
+            bucket_size += param_size
+
+        self._update_tensor_bucket(dtype_to_named_tensors)
+
+        torch.cuda.empty_cache()
+        print_gpu_memory_usage("After sync model weights in vllm engine")
+
+    def load(self, model):
+        torch.cuda.empty_cache()
+        assert self.loaded is False, "sglang engine has already been loaded"
+
+        dist.barrier(self.gloo_group)
+        print_gpu_memory_usage("Before sglang wake up in sglang engine")
+        
+        # self._wake_up(tags=["weights"])
+        self.update_weights(model)
+        # self._wake_up(tags=["kv_cache"])
+        dist.barrier(self.gloo_group)
+
+        print_gpu_memory_usage("After sglang wake up in sglang engine")
+        self.loaded = True
+
+    def offload(self):
+        assert self.loaded is True, "sglang engine has not been loaded"
+
+        dist.barrier(self.gloo_group)
+        # print_gpu_memory_usage("Before sglang offload in sglang engine")
+        # self._sleep()
+        # print_gpu_memory_usage("After sglang offload in sglang engine")
+
+        torch.cuda.empty_cache()
+        self.loaded = False
+
+    def _launch_router(self):
+        router_args = RouterArgs(
+            host=get_host(),
+            port=get_available_port(),
+            worker_urls=self.worker_urls,
+            log_level="error"
+        )
+        self.router_url = f"http://{router_args.host}:{router_args.port}"
+        print(f"Router URL: {self.router_url}")
+
+        router_process = multiprocessing.Process(
+            target=launch_router, args=(router_args,)
+        )
+        router_process.start()
+        PROCESSES.append(router_process)
+        # sync_request(self.router_url, "health", "GET", 10, 10)
+
+    def _launch_server(self):
+        server_args = ServerArgs(
+            enable_memory_saver=True,
+            host=get_host(),
+            port=get_available_port(),
+            model_path=self.model,
+            log_level="error",
+            **self.config.sglang.to_dict()
         )
 
-    async def agenerate(self, prompts: DataProto):
-        raise NotImplementedError("SGLangEngine.agenerate is not implemented yet")
+        ori_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = self.tp_cuda_visible_devices
+        server_process = launch_server_process(server_args)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ori_devices
 
-    # ------------------------------------------------------------------
-    # Workflow helpers (agentic / multi-turn)
-    # ------------------------------------------------------------------
-    def submit(self, *args, **kwargs):
-        raise NotImplementedError("SGLangEngine.submit is not implemented yet")
+        PROCESSES.append(server_process)
 
-    def wait(self, *args, **kwargs):
-        raise NotImplementedError("SGLangEngine.wait is not implemented yet")
+        self.worker_url = server_args.url()
+        self.worker_urls = gather_and_concat_list(
+            [self.worker_url],
+            self.device_mesh["dp"].get_group()
+        )
 
-    def pause(self):
-        raise NotImplementedError("SGLangEngine.pause is not implemented yet")
+    def _prepare_environment_variables(self):
 
-    def resume(self):
-        raise NotImplementedError("SGLangEngine.resume is not implemented yet")
+        if "TORCHELASTIC_USE_AGENT_STORE" in os.environ.keys():
+            del os.environ["TORCHELASTIC_USE_AGENT_STORE"]
+
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cuda_visible_devices:
+            cuda_visible_devices = cuda_visible_devices.split(",")
+            cuda_visible_device = cuda_visible_devices[int(os.environ["LOCAL_RANK"])]
+        else:
+            cuda_visible_device = os.environ["LOCAL_RANK"]
+
+        tp_visible_devices = self.device_mesh["tp"].size() * [None]
+        dist.all_gather_object(
+            tp_visible_devices,
+            cuda_visible_device,
+            self.device_mesh["tp"].get_group(),
+        )
+
+        # Cache the ordered device list for later use when spawning server processes.
+        self.tp_cuda_visible_devices = ",".join(tp_visible_devices)
+        monkey_patch_torch_reductions()
+
+    def _sleep(self, tags=["weights", "kv_cache"]) -> None:
+        if self.config.async_mode:
+            return
+
+        if self.device_mesh["tp"].get_local_rank() != 0:
+            return
+
+        try:
+            sync_request(self.worker_url, "release_memory_occupation", json={"tags": tags})
+        except Exception as exc:
+            print(f"[SGLangEngine] Failed to call release_memory_occupation on {self.worker_url}: {exc}")
+
+    def _wake_up(self, tags=["weights", "kv_cache"]) -> None:
+        if self.config.async_mode:
+            return
+
+        if self.device_mesh["tp"].get_local_rank() != 0:
+            return
+
+        try:
+            print_gpu_memory_usage(f"Before sglang wake up {tags} in sglang engine")
+            sync_request(self.worker_url, "resume_memory_occupation", json={"tags": tags})
+            print_gpu_memory_usage(f"After sglang wake up {tags} in sglang engine")
+            self._wait_worker_ready()
+        except Exception as exc:
+            print(f"[SGLangEngine] Failed to call resume_memory_occupation on {self.worker_url}: {exc}")
+
+    def _wait_worker_ready(self, timeout: float = 300.0, interval: float = 1.0) -> None:
+        if self.device_mesh["tp"].get_local_rank() != 0:
+            return
+        worker_url = getattr(self, "worker_url", None)
+        if not worker_url:
+            return
+
+        end_time = time.time() + timeout
+        last_error: Optional[Exception] = None
+
+        while time.time() < end_time:
+            try:
+                # sync_request(worker_url, endpoint, method="GET", max_trials=1, retry_delay=interval)
+                sync_request(self.router_url, "health", "GET", 1, interval)
+                return
+            except Exception as exc:  # noqa: PERF203
+                last_error = exc
+            time.sleep(interval)
+
+        raise RuntimeError(
+            f"SGLang worker at {worker_url} failed health check after wake up. Last error: {last_error}"
+        )
+
+    def _collect_sync(self, engine_inputs: List[Dict[str, Any]]) -> List[List[int]]:
+        raw_responses: List[Any] = []
+        print(f"sending request to {self.router_url}, workers: {self.worker_urls}")
+        for payload in engine_inputs:
+            raw_responses.extend(self._sync_adapter.generate(payload))
+        return self._decode_responses(raw_responses)
+
+    async def _collect_async(self, engine_inputs: List[Dict[str, Any]]) -> List[List[int]]:
+        raw_responses = await self._async_adapter.generate_batch(engine_inputs)
+        return self._decode_responses(raw_responses)
+
+    def _decode_responses(self, raw_responses: Sequence[Any]) -> List[List[int]]:
+        collected: List[List[int]] = []
+        for raw in raw_responses:
+            responses = raw if isinstance(raw, list) else [raw]
+            for resp in responses:
+                tokens = self._extract_response_tokens(resp)
+                collected.append(tokens[: self.config.response_length])
+        return collected
+
+    def _extract_response_tokens(self, response: Dict[str, Any]) -> List[int]:
+        if response is None:
+            return []
+
+        text_tokens: Optional[List[int]] = None
+        text = response.get("text")
+        if isinstance(text, str):
+            filtered = _strip_role_prefix(text)
+            text_tokens = (
+                self.tokenizer.encode(filtered, add_special_tokens=False) if filtered else []
+            )
+
+        if "output_ids" in response:
+            tokens = self._sanitize_output_ids(response["output_ids"])
+            if text_tokens is not None:
+                return self._align_tokens_with_text(tokens, text_tokens)
+            return tokens
+
+        meta_info = response.get("meta_info", {})
+        if "output_ids" in meta_info:
+            tokens = self._sanitize_output_ids(meta_info["output_ids"])
+            if text_tokens is not None:
+                return self._align_tokens_with_text(tokens, text_tokens)
+            return tokens
+
+        token_logprobs = meta_info.get("output_token_logprobs")
+        if token_logprobs:
+            tokens = []
+            for entry in token_logprobs:
+                if isinstance(entry, (list, tuple)):
+                    tokens.append(int(entry[1]))
+                elif isinstance(entry, dict):
+                    tokens.append(int(entry.get("token_id", entry.get("token", 0))))
+            if tokens:
+                return tokens
+
+        if text_tokens is not None:
+            return text_tokens
+        return []
+
+    def _sanitize_output_ids(self, token_ids: Sequence[int]) -> List[int]:
+        if not token_ids:
+            return []
+
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        start = 0
+        while start < len(token_ids):
+            token = token_ids[start]
+            if (eos_id is not None and token == eos_id) or (pad_id is not None and token == pad_id):
+                start += 1
+                continue
+            break
+        if start == 0:
+            return list(token_ids)
+        return list(token_ids[start:])
+
+    def _align_tokens_with_text(
+        self, candidate_tokens: List[int], text_tokens: List[int]
+    ) -> List[int]:
+        if not text_tokens:
+            return candidate_tokens
+        if not candidate_tokens:
+            return text_tokens
+
+        match_start = self._find_subsequence(candidate_tokens, text_tokens)
+        if match_start != -1:
+            return candidate_tokens[match_start:]
+
+        return text_tokens
+
+    def _update_tensor_bucket(
+            self, dtype_to_named_tensors: Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]
+        ):
+
+        torch.cuda.synchronize()
+        serialized_tensors = []
+        for named_tensors in dtype_to_named_tensors.values():
+
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors)
+            flattened_tensor_data = {
+                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                "metadata": flattened_tensor_bucket.get_metadata()
+            }
+            serialized_tensors.append(
+                MultiprocessingSerializer.serialize(
+                    flattened_tensor_data, output_str=True
+                )
+            )
+
+        gathered_serialized_tensors = [
+            None for _ in range(self.device_mesh["tp"].size())
+        ] if self.device_mesh["tp"].get_local_rank() == 0 else None
+        dist.gather_object(
+            serialized_tensors,
+            gathered_serialized_tensors,
+            group_dst=0,
+            group=self.device_mesh["tp"].get_group(),
+        )
+        # [
+        #     [tp0_bucket0, tp0_bucket1, ...],
+        #     [tp1_bucket0, tp1_bucket1, ...],
+        #     ...
+        # ]
+        if self.device_mesh["tp"].get_local_rank() == 0:
+
+            for serialized_named_tensors in zip(*gathered_serialized_tensors):
+                # [
+                #     (tp0_bucket0, tp1_bucket0, ...),
+                #     (tp0_bucket1, tp1_bucket1, ...),
+                #     ...
+                # ]
+                # HTTP server only sends meta data. Actual weights will be directly 
+                # copied from GPUs
+                sync_request(
+                    self.worker_url,
+                    "update_weights_from_tensor",
+                    json={
+                        "serialized_named_tensors": serialized_named_tensors,
+                        "load_format": "flattened_bucket",
+                        "flush_cache": False
+                    }
+                )
+
+
+def get_host() -> str:
+    hostname = socket.gethostname()
+    return socket.gethostbyname(hostname)
+
+def get_available_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.listen(1)
+        return s.getsockname()[1]
+
+def sync_request(
+    url: str,
+    endpoint: str,
+    method: Literal["POST", "GET"] = "POST",
+    max_trials: int = 3,
+    retry_delay: int = 1,
+    **kwargs
+):
+    with requests.Session() as session:
+        for trial in range(max_trials):
+            try:
+                match method:
+                    case "POST":
+                        response = session.post(f"{url}/{endpoint}", **kwargs)
+                    case "GET":
+                        response = session.get(f"{url}/{endpoint}", **kwargs)
+
+                response.raise_for_status()
+                try:
+                    return response.json()
+                except json.decoder.JSONDecodeError:
+                    return response.text
+
+            except:
+                if trial == max_trials - 1:
+                    raise
+                time.sleep(retry_delay)
+
+def _strip_role_prefix(text: str) -> str:
+    """Remove leading role markers like 'assistant' to match vLLM output."""
+    if not text:
+        return text
+    stripped = text.lstrip()
+    lowered = stripped.lower()
+    if lowered.startswith("assistant"):
+        stripped = stripped[len("assistant"):]
+        return stripped.lstrip(" :\n\t")
+    return stripped

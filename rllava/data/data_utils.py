@@ -1,6 +1,7 @@
 import ast
 import math
 import torch
+import base64
 import numpy as np
 from typing import Union, Optional, Dict, Any, List, Tuple
 from io import BytesIO
@@ -218,3 +219,17 @@ def get_value_from_kwargs(kwargs, name):
         return kwargs.pop(name)
     else:
         return None
+
+def image2base64(images: list[ImageObject] | ImageObject) -> list[str]:
+    if isinstance(images, ImageObject):
+        images = [images]
+
+    byte_images = []
+    for image in images:
+        with BytesIO() as buffer:
+            image.save(buffer, format="PNG")
+            buffer.seek(0)
+            byte_image = base64.b64encode(buffer.read()).decode("utf-8")
+            byte_images.append(byte_image)
+
+    return byte_images

@@ -10,6 +10,8 @@ from rllava.utils.logger import Tracking, ValidationGenerationsLogger
 from rllava.utils.config import BaseConfig
 
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 class Pipeline:
 

@@ -1,11 +1,14 @@
 import os, torch
 import torch.distributed as dist
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple, List, Optional
 from rllava.data.protocol import DataProto, pad_dataproto_to_divisor, all_gather_data_proto
 
   
 
 def init_dist() -> None:
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+
     # Initialize torch.distributed when launched via torchrun so DistributedSampler activates
     if not dist.is_available() or dist.is_initialized():
         return
@@ -204,3 +207,51 @@ def gather_batch(batch) -> DataProto:
     world_size = dist.get_world_size()
     all_gather_data_proto(batch, size=world_size, group=dist.group.WORLD)
     return batch
+
+def broadcast_object(
+    obj: Optional[Any],
+    src: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
+    group_src: Optional[int] = None
+) -> Any:
+
+    object_list = [obj]
+    dist.broadcast_object_list(
+        object_list,
+        src=src,
+        group=_unwrap_process_group(process_group),
+        group_src=group_src
+    )
+    return object_list[0]
+
+def gather_and_concat_list(
+    lst: List[Any], process_group: dist.ProcessGroup
+) -> Optional[List[Any]]:
+
+    lists = (
+        dist.get_world_size(process_group) * [None]
+        if dist.get_rank(process_group) == 0
+        else None
+    )
+    dist.gather_object(
+        lst,
+        lists,
+        group=_unwrap_process_group(process_group),
+        group_dst=0
+    )
+    return (
+        [item for lst in lists for item in lst]
+        if dist.get_rank(process_group) == 0
+        else None
+    )
+
+def _unwrap_process_group(
+    process_group: dist.ProcessGroup
+) -> dist.ProcessGroup:
+
+    if hasattr(process_group, "group"):
+        return process_group.group
+    elif hasattr(process_group, "get_group"):
+        return process_group.get_group()
+    else:
+        return process_group

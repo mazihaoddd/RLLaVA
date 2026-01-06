@@ -413,7 +413,8 @@ optional_packages=(
     "xformers==0.0.32.post1"
     "bitsandbytes==0.45.3"
     "vllm==0.11.0"
-    "sglang==0.5.2"
+    "sglang[all]==0.5.2"
+    "sglang-router==0.3.0"
     "mathruler==0.1.0"
     "pylatexenc==2.10"
 )

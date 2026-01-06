@@ -1,6 +1,5 @@
 import inspect
 import logging
-import re
 import time
 import torch
 from typing import Optional, List, Dict, Union, TYPE_CHECKING
@@ -166,13 +165,11 @@ class VLLMEngine(InferenceEngine):
         non_tensor_batch = prompts.non_tensor_batch
         batch_raw_prompt_ids = non_tensor_batch.pop("raw_prompt_ids")
         batch_multi_modal_data = non_tensor_batch.pop("multi_modal_data", None)
-        if batch_size != len(batch_raw_prompt_ids):
-            raise RuntimeError("VLLM input preprocessing size mismatch across TP ranks.")
-
+        
         if batch_multi_modal_data is not None:
-            vllm_inputs = []
+            engine_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(batch_raw_prompt_ids, batch_multi_modal_data):
-                vllm_inputs.append(
+                engine_inputs.append(
                     {
                         "prompt_token_ids": list(raw_prompt_ids),
                         "multi_modal_data": _process_multi_modal_data(
@@ -185,7 +182,7 @@ class VLLMEngine(InferenceEngine):
                     }
                 )
         else:
-            vllm_inputs = [{"prompt_token_ids": list(raw_prompt_ids)} for raw_prompt_ids in batch_raw_prompt_ids]
+            engine_inputs = [{"prompt_token_ids": list(raw_prompt_ids)} for raw_prompt_ids in batch_raw_prompt_ids]
         
         lora_requests = None
         if self.lora_kwargs:
@@ -198,7 +195,7 @@ class VLLMEngine(InferenceEngine):
         
         with self.update_sampling_params(**prompts.meta_info):
             completions: List[RequestOutput] = self.inference_engine.generate(
-                prompts=vllm_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm, lora_request=lora_requests,
+                prompts=engine_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm, lora_request=lora_requests,
             )
             response_ids = [output.token_ids for completion in completions for output in completion.outputs]
             response_ids = VF.pad_2d_list_to_length(
@@ -227,7 +224,6 @@ class VLLMEngine(InferenceEngine):
         )
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
-        # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
             {
                 "prompts": input_ids,
@@ -245,26 +241,6 @@ class VLLMEngine(InferenceEngine):
             non_tensor_batch = {}
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
-
-    def _rename_weight_keys(self, actor_weights: dict[str, Union[torch.Tensor, DTensor]], model: PreTrainedModel):
-        # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
-        if not hasattr(model, "_checkpoint_conversion_mapping"):
-            return actor_weights
-
-        reverse_key_mapping = {v: k for k, v in model._checkpoint_conversion_mapping.items()}
-        original_weights = {}
-        for key, value in actor_weights.items():
-            for pattern, replacement in reverse_key_mapping.items():
-                replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
-                replacement = re.sub(r"\(.*\)", "", replacement)
-                key, n_replace = re.subn(pattern, replacement, key)
-                # Early exit of the loop
-                if n_replace > 0:
-                    break
-
-            original_weights[key] = value
-
-        return original_weights
 
     def update_weights(self, model):
         if self.lora_kwargs:

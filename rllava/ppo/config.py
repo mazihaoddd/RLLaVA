@@ -22,10 +22,8 @@ class RolloutConfig:
     disable_tqdm: bool = False
     micro_batch_size: int = 2
     val_override_config: Dict[str, Any] = field(default_factory=dict)
-    # service mode (inference rollout decoupled as HTTP service)
-    service_mode: bool = False
-    service_url: Optional[str] = None
-    service_timeout: float = 60.0
+    partial_rollout: bool = False # only available for SGLang
+    async_mode: bool = False
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)
@@ -33,9 +31,11 @@ class RolloutConfig:
     min_pixels: Optional[int] = field(default=None, init=False)
     max_pixels: Optional[int] = field(default=None, init=False)
     video_fps: float = field(default=2.0, init=False)
+    bucket_size: int = 512
     vllm: VLLMConfig = field(default_factory=VLLMConfig)
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     load_format: str = "dummy"
+
     def to_dict(self):
         return asdict(self)
 

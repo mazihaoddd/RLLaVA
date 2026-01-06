@@ -1,16 +1,17 @@
 import os
-import time
+import re
 import torch
-import requests
 import numpy as np
-from typing import Optional, Iterable, Tuple, Dict, Any, Union, TYPE_CHECKING
+from typing import Optional, Dict, Any, Union, TYPE_CHECKING
+from torch.distributed.tensor import DTensor
+from transformers import PreTrainedTokenizer, ProcessorMixin, PreTrainedModel
 from rllava.data.protocol import DataProto
-from transformers import PreTrainedTokenizer, ProcessorMixin
 from rllava.data.data_utils import process_image, process_video
+
+
 if TYPE_CHECKING:
     # Import for type checking only to avoid runtime circular import
     from rllava.ppo.config import RolloutConfig
-
 
 
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
@@ -82,31 +83,14 @@ class InferenceEngine():
             if config.limit_images:
                 self.engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
-        tp_size = self.config.tensor_parallel_size
-        dp_size = self.world_size // tp_size if tp_size > 0 else 1
-        if self.world_size % tp_size != 0:
-            raise ValueError(f"rollout world size {self.world_size} is not divisible by tp size {tp_size}.")
+        self.tp_size = self.config.tensor_parallel_size
+        self.dp_size = self.world_size // self.tp_size if self.tp_size > 0 else 1
+        if self.world_size % self.tp_size != 0:
+            raise ValueError(f"rollout world size {self.world_size} is not divisible by tp size {self.tp_size}.")
 
         # Avoid creating distributed device mesh here since engine runs only on rank0.
         # Creating a mesh would require collectives across all ranks and can deadlock.
         self.device_mesh = None
-
-    def check_health(self, base_url):
-        # Check server endpoint
-        try:
-            response = requests.get(f"{base_url}/health", timeout=30)
-            return response.status_code == 200
-        except requests.exceptions.RequestException as e:
-            return False
-        
-    def wait_for_server(self, address):
-        base_url = f"http://{address}"
-        tik = time.time()
-        while time.time() - tik < self.config.setup_timeout:
-            if self.check_health(base_url):
-                return
-            time.sleep(1)
-        raise RuntimeError("server launch failed")
 
     def generate(self, prompts: DataProto) -> DataProto:
         raise NotImplementedError()
@@ -122,20 +106,23 @@ class InferenceEngine():
     def offload(self):
         """Offload the engine."""
         raise NotImplementedError()        
-    
 
-    def set_version(self, version: int) -> None:
-        """Set the current weight version in the inference engine."""
-        raise NotImplementedError()
+    def _rename_weight_keys(self, actor_weights: dict[str, Union[torch.Tensor, DTensor]], model: PreTrainedModel):
+        # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
+        if not hasattr(model, "_checkpoint_conversion_mapping"):
+            return actor_weights
 
-    def get_version(self) -> int:
-        """Get the current weight version in the inference engine."""
-        raise NotImplementedError()
-    
-    def pause(self):
-        """Pause request submission for async rollout. Used during evaluation to prevent data over generation."""
-        raise NotImplementedError()
+        reverse_key_mapping = {v: k for k, v in model._checkpoint_conversion_mapping.items()}
+        original_weights = {}
+        for key, value in actor_weights.items():
+            for pattern, replacement in reverse_key_mapping.items():
+                replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+                replacement = re.sub(r"\(.*\)", "", replacement)
+                key, n_replace = re.subn(pattern, replacement, key)
+                # Early exit of the loop
+                if n_replace > 0:
+                    break
 
-    def resume(self):
-        """Resume request submission for async rollout."""
-        raise NotImplementedError()
+            original_weights[key] = value
+
+        return original_weights

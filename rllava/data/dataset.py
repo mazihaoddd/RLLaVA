@@ -4,8 +4,11 @@ import yaml
 import math
 import random
 import os
+import shutil
+import hashlib
 import transformers
 import torch
+import torch.distributed as dist
 import megfile
 import os
 import random
@@ -18,7 +21,7 @@ from dataclasses import dataclass
 from jinja2 import Template
 from typing import Dict,  Sequence
 from PIL import Image, ImageFile
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from .template import TemplateFactory
@@ -27,6 +30,7 @@ from .image_preprocess import ImagePreprocess
 from rllava.utils.arguments import DataArguments
 from rllava.data.data_utils import process_image, process_video
 from rllava.utils.constants import *
+from rllava.utils import dist_utils
 
 
 
@@ -77,7 +81,6 @@ class RLHFDataset(Dataset):
 
         if os.path.isdir(data_path):
             # Local directory containing dataset (e.g., HF cache format)
-            from datasets import load_from_disk
             try:
                 # Try to load as a DatasetDict with splits
                 full_dataset = load_from_disk(data_path)
@@ -97,6 +100,8 @@ class RLHFDataset(Dataset):
             # Remote dataset from huggingface hub
             self.dataset = load_dataset(data_path, split=data_split)
 
+        self.data_source = {"path": data_path, "split": data_split}
+
         self.format_prompt = None
         if format_prompt:
             with open(format_prompt, encoding="utf-8") as f:
@@ -104,18 +109,9 @@ class RLHFDataset(Dataset):
 
         if filter_overlong_prompts:
             doc2len = self.build_filter()
-            self.dataset = self.dataset.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
-                num_proc=filter_overlong_prompts_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens"
+            self.dataset = self.maybe_filter_out_long_prompts(
+                doc2len, filter_overlong_prompts_workers
             )
-            # self.dataset = self.dataset.filter(
-            #     lambda doc: len(tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
-            #     num_proc=filter_overlong_prompts_workers,
-            #     desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
-            # )
-
-            print(f"filter dataset len: {len(self.dataset)}")
 
     def _build_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt_str: str = example[self.prompt_key]
@@ -200,6 +196,79 @@ class RLHFDataset(Dataset):
                     traceback.print_exc()
                     return self.max_prompt_length + 1
         return doc2len
+
+    def _dist_barrier(self):
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+    def maybe_filter_out_long_prompts(self, doc2len, num_workers: int):
+        cache_path = self._filter_cache_path()
+        cached = self._load_filtered_dataset_from_cache(cache_path)
+        if cached is not None:
+            return cached
+
+        if dist_utils.is_rank0():
+            filtered = self.dataset.filter(
+                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                num_proc=num_workers,
+                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+            )
+            # self.dataset = self.dataset.filter(
+            #     lambda doc: len(tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+            #     num_proc=filter_overlong_prompts_workers,
+            #     desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+            # )
+            print(f"filter dataset len: {len(filtered)}")
+            if os.path.isdir(cache_path):
+                shutil.rmtree(cache_path)
+            filtered.save_to_disk(cache_path)
+        self._dist_barrier()
+
+        cached = self._load_filtered_dataset_from_cache(cache_path)
+        if cached is None:
+            raise RuntimeError(f"Failed to load filtered dataset cache from {cache_path}.")
+
+        self._dist_barrier()
+        return cached
+
+    def _filter_cache_path(self) -> str:
+        cache_root = os.environ.get(
+            "RLLAVA_FILTER_CACHE_DIR",
+            os.path.join(os.path.expanduser("~"), ".cache", "rllava", "filtered"),
+        )
+        os.makedirs(cache_root, exist_ok=True)
+
+        format_prompt_hash = None
+        if self.format_prompt is not None:
+            format_prompt_hash = hashlib.md5(self.format_prompt.encode("utf-8")).hexdigest()
+
+        payload = {
+            "data_path": self.data_source["path"],
+            "data_split": self.data_source["split"],
+            "max_prompt_length": self.max_prompt_length,
+            "prompt_key": self.prompt_key,
+            "answer_key": self.answer_key,
+            "image_key": self.image_key,
+            "video_key": self.video_key,
+            "min_pixels": self.min_pixels,
+            "max_pixels": self.max_pixels,
+            "video_fps": self.video_fps,
+            "format_prompt_hash": format_prompt_hash,
+            "processor_cls": type(self.processor).__name__ if self.processor else None,
+            "tokenizer_cls": type(self.tokenizer).__name__ if self.tokenizer else None,
+            "dataset_fingerprint": getattr(self.dataset, "_fingerprint", None),
+        }
+        cache_key = hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return os.path.join(cache_root, cache_key)
+
+    def _load_filtered_dataset_from_cache(self, cache_path: str):
+        if not os.path.isdir(cache_path):
+            return None
+        try:
+            return load_from_disk(cache_path)
+        except Exception:
+            traceback.print_exc()
+            return None
 
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
         messages = self._build_messages(example) # [{'role': 'user', 'content': [{...}, {...}]}]

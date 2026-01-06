@@ -19,6 +19,8 @@ from rllava.utils.tokenizer import load_tokenizer_and_processor
 class RLVRPipeline(Pipeline):
 
     def __init__(self, model, config: BaseConfig, train_dataloader: DataLoader, val_dataloader: DataLoader):
+        model.initialize(train_dataloader)
+        
         super().__init__(model, config, train_dataloader, val_dataloader)
         self.config: PPOConfig = self.config  # Explicitly specify the type of self.config
         self.model: PPO = self.model
@@ -138,7 +140,6 @@ def main():
     train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
 
     model = PPOFactory.build(config, tokenizer, processor)
-    model.initialize(train_dataloader)
 
     pipeline = RLVRPipeline(config=config,
                             train_dataloader=train_dataloader,
