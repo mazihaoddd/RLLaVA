@@ -95,8 +95,8 @@ We support a broad family of RL methods, enabled by simple config switches:
 - Support for LLMs (e.g., Qwen3, LLaMA) in text-only RL scenarios
 
 **Backends:**
-- **Training**: FSDP, FSDP2，DeepSpeed
-- **Inference**: vLLM, HuggingFace
+- **Training**: FSDP, FSDP2, DeepSpeed
+- **Inference**: SGLang, vLLM, HuggingFace
 
 
 ## 🤝 Contributing & Community
