@@ -6,7 +6,8 @@
 
 <p align="center">
 <img src="./assets/arxiv.png" width="14px" style="display:inline;"> <a href="https://arxiv.org/abs/2512.21450" target="_blank">Arxiv(RLLaVA)</a> ｜
-🤗 <a href="https://huggingface.co/collections/mzh12345/rllava" target="_blank">Models(RLLaVA)</a>
+🤗 <a href="https://huggingface.co/collections/mzh12345/rllava" target="_blank">Models(RLLaVA)</a> ｜
+<a href="https://qingkeai.online/archives/RLLaVA" target="_blank">Blog(RLLaVA)</a>
 <p align="center">
 
 <h5 align="center"> If you like our project, please send us a star ⭐ on GitHub.</h5>
