@@ -110,33 +110,21 @@ class DeepSpeedAccelerator(TrainEngine):
         self.wait_for_everyone()
         log_with_rank(f"Saved DeepSpeed checkpoint to {local_path}", rank=self.rank, logger=logger)
 
-    def backward(self, loss: torch.Tensor):
+    def backward(self, loss: torch.Tensor, is_last_step: bool = True):
         """Perform backward pass with gradient accumulation support.
         
-        DeepSpeed requires setting gradient_accumulation_boundary to False during
-        intermediate backward passes to accumulate gradients properly.
+        Args:
+            loss: The loss tensor to backpropagate.
+            is_last_step: If True, this is the last micro_batch in the accumulation,
+                         triggers allreduce. If False, gradients are accumulated locally.
         """
-        # Disable boundary during backward to accumulate gradients
-        self.ds_engine.set_gradient_accumulation_boundary(is_boundary=False)
+        # Set boundary based on whether this is the last accumulation step
+        # boundary=True triggers allreduce in DeepSpeed ZeRO
+        self.ds_engine.set_gradient_accumulation_boundary(is_boundary=is_last_step)
         kwargs = {"scale_wrt_gas": False}
         self.ds_engine.backward(loss, **kwargs)
 
     def optimizer_step(self, model: DeepSpeedEngine, optimizer):
-        """Execute optimizer step after gradient accumulation.
-        
-        Sets the gradient accumulation boundary to True and performs the step.
-        Returns the global gradient norm.
-        """
-        # Enable boundary and perform step
-        model.set_gradient_accumulation_boundary(is_boundary=True)
-        
-        # Check if gradients have been accumulated
-        # This prevents KeyError when averaged_gradients is empty
-        if hasattr(model.optimizer, 'averaged_gradients') and not model.optimizer.averaged_gradients:
-            # No gradients accumulated, perform a dummy backward to initialize
-            log_with_rank("Warning: No gradients accumulated, skipping optimizer step", rank=self.rank, logger=logger)
-            return torch.tensor(0.0)
-        
         model.step()
         
         return model.get_global_grad_norm()
