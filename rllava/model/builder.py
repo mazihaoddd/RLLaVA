@@ -132,31 +132,14 @@ def build_optimizer(config: OptimConfig, model: nn.Module):
 
 
 def get_init_weight_context(use_meta_tensor: bool = True, mesh: DeviceMesh = None):
-    """Get the appropriate weight initialization context.
-    
-    For FSDP (mesh is not None): Use meta tensor on non-primary ranks to save memory.
-    For DeepSpeed (mesh is None): Use CPU init on all ranks as DeepSpeed doesn't support meta tensors.
-    
-    Args:
-        use_meta_tensor: Whether to use meta tensor initialization (for memory optimization).
-        mesh: DeviceMesh for FSDP. If None, indicates non-FSDP backend (e.g., DeepSpeed).
-    
-    Returns:
-        A context manager for weight initialization.
-    """
     from accelerate import init_empty_weights
     
     cpu_init_weights = lambda: torch.device("cpu")
-    
     if use_meta_tensor:
         if mesh is None:
-            # DeepSpeed or single-GPU: use CPU init on all ranks
-            # DeepSpeed doesn't support meta tensor initialization
-            init_context = cpu_init_weights
+            init_context = init_empty_weights if not is_rank0() else cpu_init_weights
         else:
-            # FSDP: use meta tensor on non-primary ranks
             init_context = init_empty_weights if mesh.get_coordinate()[-1] != 0 else cpu_init_weights
     else:
         init_context = cpu_init_weights
-    
     return init_context
