@@ -105,7 +105,7 @@ We support a broad family of RL methods, enabled by simple config switches:
 We welcome contributions! We're especially interested in new RL algorithms, multi-modal tasks, and resource-constrained improvements. Have questions? Join our WeChat group:
 
 <div align="center">
-  <img src="assets/wechat.jpg" alt="RLLaVA WeChat Group" width="200">
+  <img src="assets/fdeffea0104de79fb2d744c9f756a140.jpg" alt="RLLaVA WeChat Group" width="200">
 </div>
 
 ## 🙏 Acknowledgements
