@@ -114,10 +114,13 @@ Our RL algorithms and distributed training implementation draw inspiration from 
 ## Citation
 
 ```bibtex
-@misc{zhao2025rllava,
-  title        = {RLLaVA: An RL-central Framework for Language and Vision Assistants},
-  author       = {Lei Zhao, Zihao Ma, Boyu Lin, Yuhe Liu, Wenjun Wu, Lei Huang},
-  howpublished = {\url{https://github.com/TinyLoopX/RLLaVA}},
-  year         = {2025}
+@misc{zhao2025rllavarlcentralframeworklanguage,
+      title={RLLaVA: An RL-central Framework for Language and Vision Assistants}, 
+      author={Lei Zhao and Zihao Ma and Boyu Lin and Yuhe Liu and Wenjun Wu and Lei Huang},
+      year={2025},
+      eprint={2512.21450},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2512.21450}, 
 }
 ```
