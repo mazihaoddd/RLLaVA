@@ -10,6 +10,10 @@ from tqdm import tqdm
 from codetiming import Timer
 from collections import defaultdict
 from ..utils.core_algos import kl_penalty, agg_loss
+from rllava.ppo.plugins.policy_loss import (
+    get_policy_loss_extra_keys,
+    build_policy_loss_kwargs,
+)
 from rllava.data.protocol import DataProto
 from rllava.utils.device import get_torch_device
 from rllava.model.builder import build_model, build_optimizer
@@ -127,6 +131,9 @@ class Actor(PolicyRole):
             "position_ids",
             "advantages",
         ]
+        for key in get_policy_loss_extra_keys(self.policy_loss):
+            if key in data.batch.keys():
+                select_keys.append(key)
         
         if use_kl_loss:
             select_keys.append("ref_log_probs")
@@ -196,13 +203,17 @@ class Actor(PolicyRole):
                         micro_batch=model_inputs,
                         temperature=temperature,
                         calculate_entropy=calculate_entropy,
-                        return_logits=True if self.config.sft_loss_coef > 0 else False,
+                        return_logits=False,
                     )
 
                     if on_policy:
                         old_log_probs = log_probs.detach()
                     else:
                         old_log_probs = model_inputs["old_log_probs"]
+
+                    policy_loss_kwargs = build_policy_loss_kwargs(
+                        self.policy_loss, model_inputs=model_inputs, metrics=micro_batch_metrics
+                    )
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = self.policy_loss(
                         old_log_prob=old_log_probs,
@@ -212,31 +223,19 @@ class Actor(PolicyRole):
                         loss_agg_mode=self.config.loss_agg_mode,
                         config=self.config,
                         rollout_log_probs=rollout_log_probs,
+                        entropy=entropy,
+                        **policy_loss_kwargs,
                     )
 
                     if self.config.entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                        # entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode='token-mean')
+                        micro_batch_metrics["actor/entropy_loss"] = entropy_loss.detach().item()
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
                     else:
                         policy_loss = pg_loss
-                    # UFT-style joint SFT loss against ground_truth (optional)
-                    if getattr(self.config, "sft_loss_coef", 0.0) and self.config.sft_loss_coef > 0 and self.tokenizer is not None:
-                        if "ground_truth" in model_inputs:
-                            gt_texts = [str(x) for x in model_inputs["ground_truth"]]
-                            tok = self.tokenizer(gt_texts, add_special_tokens=False, return_tensors="pt", padding=True, truncation=True)
-                            target_ids = tok["input_ids"].to(logits_slice.device)
-                            bsz, resp_len = logits_slice.size(0), logits_slice.size(1)
-                            if target_ids.size(1) > resp_len:
-                                target_ids = target_ids[:, :resp_len]
-                            elif target_ids.size(1) < resp_len:
-                                pad = torch.full((target_ids.size(0), resp_len - target_ids.size(1)), -100, dtype=target_ids.dtype, device=target_ids.device)
-                                target_ids = torch.cat([target_ids, pad], dim=1)
-                            ce = F.cross_entropy(logits_slice.reshape(-1, logits_slice.size(-1)), target_ids.reshape(-1), ignore_index=-100, reduction='none').reshape(bsz, resp_len)
-                            sft_loss = agg_loss(loss_mat=ce, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
-                            policy_loss = policy_loss + self.config.sft_loss_coef * sft_loss
-                            micro_batch_metrics["actor/sft_loss"] = sft_loss.detach().item() * loss_scale_factor
-                    
+
                     if use_kl_loss:
                         ref_log_probs = model_inputs["ref_log_probs"]
                         # compute kl loss

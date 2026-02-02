@@ -90,7 +90,7 @@ class RLVRPipeline(Pipeline):
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
                 with timer("gen", timing_raw):
-                    batch = self.model.rollout_batch(self.data_iterator)
+                    batch = self.model.rollout_batch(self.data_iterator, global_step=self.global_steps)
 
                 with timer("log_prob", timing_raw):
                     batch = self.model.compute_log_probs(batch)

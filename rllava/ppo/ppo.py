@@ -25,12 +25,13 @@ from rllava.utils.logger.aggregate_logger import print_rank_0
 
 class PPO():
     
-    def __init__(self, config: PPOConfig, tokenizer, processor, reward: Reward, rollout: Rollout, adv_estimator=None, policy_loss=None):
+    def __init__(self, config: PPOConfig, tokenizer, processor, reward: Reward, rollout: Rollout, adv_estimator=None, policy_loss=None, experience_mixer=None):
         self.config = config
         self.train_batch_size = config.data.train_batch_size
         self.tokenizer = tokenizer
         self.processor = processor
         self._cache = {}
+        self.experience_mixer = experience_mixer
 
         if config.algorithm.use_kl_in_reward and config.algorithm.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
@@ -105,6 +106,7 @@ class PPO():
         self.filter = online_sampling
 
     def initialize(self, train_dataloader):
+        self.train_dataloader = train_dataloader
         self.training_steps = self.get_training_steps(train_dataloader)
 
         self.rollout.initialize(self.config.actor.model.model_path)
@@ -120,6 +122,13 @@ class PPO():
             self.ref.initialize(self.actor)
         
         self.reward.initialize()
+        if self.experience_mixer is not None:
+            self.experience_mixer = self.experience_mixer(
+                config=self.config,
+                rollout=self.rollout,
+                reward=self.reward,
+                train_dataloader=self.train_dataloader,
+            )
 
     def get_training_steps(self, train_dataloader):  
         if self.config.trainer.max_steps is not None:
@@ -141,7 +150,7 @@ class PPO():
             critic_path = os.path.join(checkpoint_path, "critic")
             self.critic.save_checkpoint(critic_path, save_model_only=self.config.trainer.save_model_only)
 
-    def rollout_batch(self, data_iterator) -> DataProto:
+    def rollout_batch(self, data_iterator, global_step: int | None = None) -> DataProto:
         batch = None
         num_try_make_batch = 0
         print_rank_0("Start generating batch...")
@@ -150,7 +159,7 @@ class PPO():
                 num_try_make_batch += 1
                 batch_in = dist_batch(data_iterator)
 
-                new_batch = self.rollout.generate_one_batch(batch_in, self.filter)
+                new_batch = self.rollout.generate_one_batch(batch_in, self.filter, global_step=global_step)
                 new_batch = gather_batch(new_batch)
 
                 batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
@@ -166,9 +175,12 @@ class PPO():
                 else:
                     print_rank_0(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                     result = batch[: self.train_batch_size * self.rollout.n]
+                    if self.experience_mixer is not None:
+                        result = self.experience_mixer.apply(result)
                     result.meta_info["global_token_num"] = torch.sum(result.batch["attention_mask"], dim=-1).tolist()
                     result = result.chunk(dist.get_world_size())[dist.get_rank()]
                     return result
+
         
     @contextmanager
     def generate_context(self):

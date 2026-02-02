@@ -23,7 +23,7 @@ class VLLMConfig:
     """
 
     model: str = ""
-    seed: Optional[int] = 1
+    seed: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     dtype: str = "bfloat16"

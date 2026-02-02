@@ -145,7 +145,6 @@ class ActorConfig:
     """clip ratio in PPO & DAPO"""
     clip_ratio_c: float = 3.0
     """constant C in dual-clip PPO, clips when advantage < -C"""
-    clip_upper_bound: float = 1.0
     loss_agg_mode: str = "token-mean"
     """loss aggregate mode: `token-mean`, `seq-mean-token-sum`"""
     entropy_coeff: float = 0
@@ -153,6 +152,8 @@ class ActorConfig:
     ppo_epochs: int = 1
     """number of ppo epochs for each rollout batch"""
     use_torch_compile: bool = True
+    # UFT-style joint SFT loss (cross-entropy over ground_truth)
+    sft_loss_coef: float = 0.0
     model: ModelConfig = field(default_factory=ModelConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
@@ -161,25 +162,6 @@ class ActorConfig:
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
     kl_loss_coef: float = 0.01
     kl_loss_type: str = "low_var_kl"
-    # SFT&RFT configs
-    loss_remove_clip: bool = False
-    off_policy_reshape: str = "no_reshape"
-    off_policy_reshape_weight: float = 0.1
-    off_policy_reshape_pow_exp: float = 0.5
-    off_policy_cliprange: float = 0.2
-    off_policy_normalize: bool = False
-    off_policy_max_clip: float = -1
-    off_policy_min_clip: float = -1
-    all_max_clip: float = -1
-    on_policy_reshape: str = "no_reshape"
-    on_policy_reshape_weight: float = 0.1
-    on_policy_reshape_pow_exp: float = 0.5
-    srft_type: str = "paper"
-    hpt_hint_loss_coef: float = 0.0
-    offline_loss_type: str = "off_policy"
-    sft_loss_coef: float = 1.0
-
-    
 
 
 @dataclass
@@ -227,14 +209,6 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""    
-    # # SFT&RFT configs
-    unify_strategy: str = "none"  # "none" | "switch" | "soft"
-    switch_gate: int = 0
-    switch_gate_off: int = 0
-    success_reward_threshold: float = 1.0
-    off_policy_replace_num: int = 1
-    off_policy_replace_num_mid: int = 0
-    remove_sfted_data: bool = False
 
 
 @dataclass
@@ -253,10 +227,4 @@ class PPOConfig(BaseConfig):
         self.rollout.min_pixels = self.data.min_pixels
         self.rollout.max_pixels = self.data.max_pixels
         self.rollout.video_fps = self.data.video_fps
-        # normalize rollout.seed: "none"/"null" -> None, numeric string -> int
-        if isinstance(self.rollout.seed, str):
-            if self.rollout.seed.lower() in ("none", "null"):
-                self.rollout.seed = None
-            else:
-                self.rollout.seed = int(self.rollout.seed)
 

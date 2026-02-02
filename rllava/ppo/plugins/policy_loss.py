@@ -23,7 +23,10 @@ PolicyLossFn = Callable[
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
 
 
-def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
+def register_policy_loss(
+    name: str,
+    extra_keys: Optional[list[str] | set[str]] = None,
+) -> Callable[[PolicyLossFn], PolicyLossFn]:
     """Register a policy loss function with the given name.
 
     Args:
@@ -35,9 +38,31 @@ def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
 
     def decorator(func: PolicyLossFn) -> PolicyLossFn:
         POLICY_LOSS_REGISTRY[name] = func
+        func.extra_keys = set(extra_keys or [])
         return func
 
     return decorator
+
+
+def get_policy_loss_extra_keys(policy_loss_fn: PolicyLossFn) -> set[str]:
+    return getattr(policy_loss_fn, "extra_keys", set())
+
+
+def build_policy_loss_kwargs(
+    policy_loss_fn: PolicyLossFn,
+    model_inputs: dict,
+    metrics: dict
+) -> dict:
+    extra_keys = getattr(policy_loss_fn, "extra_keys", set())
+    if not extra_keys:
+        return {}
+
+    kwargs: dict = {}
+    for key in extra_keys:
+        if key in model_inputs:
+            kwargs[key] = model_inputs.get(key)
+    kwargs['metrics'] = metrics
+    return kwargs
 
 
 def get_policy_loss(name):
@@ -58,14 +83,6 @@ def get_policy_loss(name):
     return POLICY_LOSS_REGISTRY[loss_name]
 
 
-# @register_objective("sft_mix")
-# def _obj_sft_mix(ctx: dict, kwargs: dict):
-#     # simple CE-like mix: encourage higher log_probs on taken actions (i.e., -log_probs)
-#     weight = float(kwargs.get("weight", 0.05))
-#     loss = -(ctx["log_probs"] * ctx["response_mask"]).sum() / (ctx["response_mask"].sum() + 1e-8)
-#     return weight * loss, {"sft/mix_weight": weight}
-
-
 @register_policy_loss("vanilla")
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
@@ -75,6 +92,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgorithmConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -126,13 +144,18 @@ def compute_policy_loss_vanilla(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(
-        ratio, 1 - cliprange_low, 1 + cliprange_high
-    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(
-        pg_losses1, pg_losses2
-    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = VF.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    if config.loss_remove_clip:
+        pg_losses2 = pg_losses1
+        clip_pg_losses1 = pg_losses1
+        pg_clipfrac = torch.tensor(0.0, device=pg_losses1.device)
+    else:
+        pg_losses2 = -advantages * torch.clamp(
+            ratio, 1 - cliprange_low, 1 + cliprange_high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(
+            pg_losses1, pg_losses2
+        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = VF.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
@@ -140,7 +163,11 @@ def compute_policy_loss_vanilla(
         torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
     )
 
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    if config.loss_remove_clip:
+        pg_losses = pg_losses1
+        pg_clipfrac_lower = torch.tensor(0.0, device=pg_losses1.device)
+    else:
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
     if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
         # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
@@ -149,6 +176,473 @@ def compute_policy_loss_vanilla(
         pg_losses = pg_losses * tis_imp_ratio
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss(
+    "luffy",
+    extra_keys={"prefix_mask"}
+)
+def compute_policy_loss_luffy(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgorithmConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+    prefix_mask: torch.Tensor | None = None,
+    metrics: dict = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert config is not None
+    assert not isinstance(config, AlgorithmConfig)
+
+    if prefix_mask is None or prefix_mask.numel() == 0:
+        return compute_policy_loss_vanilla(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_log_probs=rollout_log_probs,
+        )
+
+    negative_approx_kl = log_prob - old_log_prob
+    ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
+
+    # on-policy ratio
+    on_ratio = torch.exp(negative_approx_kl)
+    on_ratio = _reshape_ratio(
+        on_ratio,
+        log_prob,
+        old_log_prob,
+        config.on_policy_reshape,
+        config.on_policy_reshape_weight,
+        config.on_policy_reshape_pow_exp,
+    )
+    on_pg_losses = -advantages * on_ratio
+    if config.loss_remove_clip:
+        on_pg_clipfrac = torch.tensor(0.0, device=on_pg_losses.device)
+        on_pg_loss = VF.masked_mean(on_pg_losses, (~prefix_mask) * response_mask)
+    else:
+        on_pg_losses2 = -advantages * torch.clamp(
+            on_ratio, 1 - config.clip_ratio, 1 + config.clip_ratio
+        )
+        on_pg_clipfrac = VF.masked_mean(torch.gt(on_pg_losses2, on_pg_losses).float(), response_mask)
+        on_pg_losses = torch.max(on_pg_losses, on_pg_losses2)
+        on_pg_loss = VF.masked_mean(on_pg_losses, (~prefix_mask) * response_mask)
+
+    # off-policy ratio
+    off_ratio = torch.exp(log_prob)
+    if config.off_policy_reshape == "classic_reject_token":
+        my_off_ratio = off_ratio.detach()
+        random_val = torch.rand_like(my_off_ratio)
+        reject_coef = torch.where(
+            my_off_ratio == 0,
+            torch.zeros_like(my_off_ratio),
+            torch.where(random_val < (1 - my_off_ratio), torch.zeros_like(my_off_ratio), 1.0 / my_off_ratio),
+        )
+    else:
+        reject_coef = None
+
+    off_ratio = _reshape_ratio(
+        off_ratio,
+        log_prob,
+        old_log_prob,
+        config.off_policy_reshape,
+        config.off_policy_reshape_weight,
+        config.off_policy_reshape_pow_exp,
+    )
+
+    off_ratio_mean = VF.masked_mean(off_ratio, prefix_mask * response_mask)
+    if off_ratio_mean.isnan().any().item():
+        off_ratio_mean = torch.tensor(0.0)
+
+    if reject_coef is not None:
+        off_pg_losses = -advantages * reject_coef * off_ratio
+    else:
+        off_pg_losses = -advantages * off_ratio
+    off_pg_loss = VF.masked_mean(off_pg_losses, prefix_mask * response_mask)
+    off_pg_clipfrac = torch.tensor(0.0)
+
+    prefix_mask = prefix_mask.float()
+    pg_losses = off_pg_losses * prefix_mask + on_pg_losses * (1 - prefix_mask)
+
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    # log on/off probs
+    off_policy_probs = torch.exp(log_prob)
+    off_policy_prob = VF.masked_mean(off_policy_probs, prefix_mask * response_mask)
+    if off_policy_prob.isnan().item() is True:
+        off_policy_prob = torch.tensor(0.0)
+    on_policy_probs = torch.exp(old_log_prob)
+    on_policy_prob = VF.masked_mean(on_policy_probs, (1.0-prefix_mask) * response_mask)
+    if on_policy_prob.isnan().item() is True:
+        on_policy_prob = torch.tensor(0.0)
+
+    if metrics is not None:
+        metrics['actor/pg_loss'] = pg_loss.detach().item()
+        metrics['actor/off_pg_loss'] = off_pg_loss.detach().item()
+        metrics['actor/on_pg_loss'] = on_pg_loss.detach().item()
+        metrics['actor/on_pg_clipfrac'] = on_pg_clipfrac.detach().item()
+        metrics['actor/off_pg_clipfrac'] = off_pg_clipfrac.detach().item()
+        metrics['actor/ppo_kl'] = ppo_kl.detach().item()
+        metrics['actor/pg_clipfrac_lower'] = torch.tensor(0.0, device=pg_loss.device).detach().item()
+        metrics['actor/off_ratio_mean'] = off_ratio_mean.detach().item()
+        metrics['actor/on_policy_prob'] = on_policy_prob.detach().item()
+        metrics['actor/off_policy_prob'] = off_policy_prob.detach().item()
+
+    return pg_loss, on_pg_clipfrac, ppo_kl, torch.tensor(0.0, device=pg_loss.device)
+
+
+@register_policy_loss(
+    "srft",
+    extra_keys={"prefix_mask", "token_level_scores", "target_probs"},
+)
+def compute_policy_loss_srft(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgorithmConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+    prefix_mask: torch.Tensor | None = None,
+    token_level_scores: torch.Tensor | None = None,
+    entropy: torch.Tensor | None = None,
+    metrics: dict = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert config is not None
+    assert not isinstance(config, AlgorithmConfig)
+
+    if prefix_mask is None or token_level_scores is None or entropy is None:
+        return compute_policy_loss_vanilla(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_log_probs=rollout_log_probs,
+        )
+
+    negative_approx_kl = log_prob - old_log_prob
+    ppo_kl = VF.masked_mean(-negative_approx_kl, response_mask)
+
+    # entropy-aware coefficients
+    H_coef = VF.masked_mean(entropy, response_mask, dim=-1)
+    H_coef = H_coef.detach()
+    sft_coef = 0.5 * torch.exp(-1 * H_coef)
+    on_coef = 0.1 * torch.exp(H_coef)
+
+    # correct/incorrect mask from reward
+    correct_answer_mask = token_level_scores.sum(-1) == 1
+    on_advantages = torch.where(
+        correct_answer_mask.unsqueeze(-1).expand_as(advantages),
+        on_coef.view(-1, 1).expand_as(advantages),
+        torch.tensor(-1.0, device=advantages.device, dtype=advantages.dtype).expand_as(advantages),
+    )
+
+    # on-policy ratio (with reshape)
+    ratio = _reshape_ratio(
+        torch.exp(negative_approx_kl),
+        log_prob,
+        old_log_prob,
+        config.on_policy_reshape,
+        config.on_policy_reshape_weight,
+        config.on_policy_reshape_pow_exp,
+    )
+
+    if config.srft_type == "exp":
+        srft_ratio = torch.exp(log_prob)
+    elif config.srft_type == "classic_rl":
+        srft_ratio = ratio
+    elif config.srft_type == "minus_old":
+        srft_ratio = log_prob - old_log_prob
+    else:
+        srft_ratio = log_prob
+
+    on_pg_losses = -on_advantages * srft_ratio
+
+    clip_upper_bound = getattr(config, "clip_upper_bound", 1.0)
+    upper_bound = max(clip_upper_bound, 1.0 + config.clip_ratio)
+    if config.loss_remove_clip:
+        on_pg_loss = VF.masked_mean(on_pg_losses, (~prefix_mask) * response_mask)
+        on_pg_clipfrac = torch.tensor(0.0, device=on_pg_losses.device)
+    else:
+        on_pg_losses2 = -on_advantages * torch.clamp(
+            log_prob, 1.0 - config.clip_ratio, upper_bound
+        )
+        on_pg_clipfrac = VF.masked_mean(torch.gt(on_pg_losses2, on_pg_losses).float(), response_mask)
+        on_pg_losses = torch.max(on_pg_losses, on_pg_losses2)
+        on_pg_loss = VF.masked_mean(on_pg_losses, (~prefix_mask) * response_mask)
+
+    # compute off-policy ratio
+    target_probs = kwargs.get("target_probs")
+    if target_probs is None:
+        off_ratio = torch.exp(log_prob)
+        reject_coef = None
+        if config.off_policy_reshape == "classic_reject_token":
+            my_off_ratio = off_ratio.detach()
+            random_val = torch.rand_like(my_off_ratio)
+            reject_coef = torch.where(
+                my_off_ratio == 0,
+                torch.zeros_like(my_off_ratio),
+                torch.where(random_val < (1 - my_off_ratio), torch.zeros_like(my_off_ratio), 1.0 / my_off_ratio),
+            )
+        elif config.off_policy_reshape == "no_reshape":
+            pass
+        elif config.off_policy_reshape == "logp":
+            off_ratio = log_prob * config.off_policy_reshape_weight
+        elif config.off_policy_reshape == "p_logp":
+            off_ratio = log_prob * config.off_policy_reshape_weight + off_ratio
+        elif config.off_policy_reshape == "square_root":
+            off_ratio = torch.sqrt(off_ratio)
+        elif config.off_policy_reshape == "p_div_p_0.1":
+            off_ratio = off_ratio / (off_ratio + 0.1)
+        elif config.off_policy_reshape == "p_div_p_0.5":
+            off_ratio = off_ratio / (off_ratio + 0.5)
+        elif config.off_policy_reshape == "p_div_p_0.3":
+            off_ratio = off_ratio / (off_ratio + 0.3)
+        elif config.off_policy_reshape == "pow":
+            off_ratio = torch.pow(off_ratio, config.off_policy_reshape_pow_exp)
+        else:
+            raise ValueError(f"Invalid off_policy_reshape: {config.off_policy_reshape}")
+    else:
+        off_ratio = torch.exp(log_prob) / (target_probs + 1e-6)
+        off_ratio = off_ratio * prefix_mask
+        reject_coef = None
+
+    off_max_clip = getattr(config, "off_policy_max_clip", -1)
+    if off_max_clip != -1:
+        off_ratio = torch.clamp(off_ratio, max=off_max_clip)
+    off_min_clip = getattr(config, "off_policy_min_clip", -1)
+    if off_min_clip != -1:
+        off_ratio = torch.clamp(off_ratio, min=off_min_clip)
+
+    off_ratio_mean = VF.masked_mean(off_ratio, prefix_mask * response_mask)
+    if off_ratio_mean.isnan().any().item():
+        off_ratio_mean = torch.tensor(0.0)
+
+    if reject_coef is not None:
+        off_pg_losses = -advantages * reject_coef * off_ratio
+    else:
+        off_pg_losses = -advantages * off_ratio
+    off_pg_loss = VF.masked_mean(off_pg_losses, prefix_mask * response_mask)
+
+    off_pg_clipfrac = torch.tensor(0.0)
+
+    if off_pg_loss.isnan().item():
+        off_pg_loss = torch.tensor(0.0, device=off_pg_losses.device)
+
+    # extra SFT loss on off-policy part
+    sft_loss = None
+    off_policy_mask = prefix_mask.any(-1)
+    if off_policy_mask.any():
+        off_log_prob = (log_prob * sft_coef.view(-1, 1))[off_policy_mask]
+        off_response_mask = response_mask[off_policy_mask]
+        if off_log_prob.numel() > 0 and off_response_mask.sum().item() > 0:
+            sft_loss = VF.masked_mean(-off_log_prob, off_response_mask)
+
+    prefix_mask = prefix_mask.float()
+    pg_losses = off_pg_losses * prefix_mask + on_pg_losses * (1 - prefix_mask)
+    # off_pg_losses_sum = off_pg_losses.sum()
+    # on_pg_losses_sum = on_pg_losses.sum()
+
+    all_max_clip = getattr(config, "all_max_clip", -1)
+    if all_max_clip != -1:
+        p_on = torch.exp(log_prob)
+        p_on_mask = (p_on <= all_max_clip).float()
+        response_mask = response_mask * p_on_mask
+        pg_losses = pg_losses * p_on_mask
+
+    if getattr(config, "loss_remove_token_mean", False):
+        pg_loss = (pg_losses * response_mask).sum() / response_mask.shape[-1]
+    else:
+        pg_loss = VF.masked_mean(pg_losses, response_mask)
+
+    if sft_loss is not None and not torch.isnan(sft_loss):
+        pg_loss = pg_loss + sft_loss
+
+    # log on/off probs
+    off_policy_probs = torch.exp(log_prob)
+    off_policy_prob = VF.masked_mean(off_policy_probs, prefix_mask * response_mask)
+    if off_policy_prob.isnan().item() is True:
+        off_policy_prob = torch.tensor(0.0)
+    on_policy_probs = torch.exp(old_log_prob)
+    on_policy_prob = VF.masked_mean(on_policy_probs, (1.0-prefix_mask) * response_mask)
+    if on_policy_prob.isnan().item() is True:
+        on_policy_prob = torch.tensor(0.0)
+
+    if metrics is not None:
+        metrics['actor/pg_loss'] = pg_loss.detach().item()
+        metrics['actor/off_pg_loss'] = off_pg_loss.detach().item()
+        metrics['actor/on_pg_loss'] = on_pg_loss.detach().item()
+        metrics['actor/on_pg_clipfrac'] = on_pg_clipfrac.detach().item()
+        metrics['actor/off_pg_clipfrac'] = off_pg_clipfrac.detach().item()
+        metrics['actor/ppo_kl'] = ppo_kl.detach().item()
+        metrics['actor/pg_clipfrac_lower'] = torch.tensor(0.0, device=pg_loss.device).detach().item()
+        metrics['actor/off_ratio_mean'] = off_ratio_mean.detach().item()
+        metrics['actor/on_policy_prob'] = on_policy_prob.detach().item()
+        metrics['actor/off_policy_prob'] = off_policy_prob.detach().item()
+        metrics['actor/sft_coef'] = sft_coef.mean().item()
+        metrics['actor/on_coef'] = on_coef.mean().item()
+        metrics['actor/H_coef'] = H_coef.mean().item()
+
+    return pg_loss, on_pg_clipfrac, ppo_kl, torch.tensor(0.0, device=pg_loss.device)
+
+
+@register_policy_loss(
+    "hpt",
+    extra_keys={"prefix_mask"},
+)
+def compute_policy_loss_hpt(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgorithmConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+    prefix_mask: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert config is not None
+    assert not isinstance(config, AlgorithmConfig)
+
+    offline_loss_type = getattr(config, "offline_loss_type", "off_policy")
+    if offline_loss_type == "sft":
+        if prefix_mask is None or prefix_mask.numel() == 0:
+            return compute_policy_loss_vanilla(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                response_mask=response_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=config,
+                rollout_log_probs=rollout_log_probs,
+            )
+
+        off_policy_mask = prefix_mask.any(-1)
+        sft_loss = None
+        if off_policy_mask.any():
+            off_log_prob = log_prob[off_policy_mask]
+            off_response_mask = response_mask[off_policy_mask]
+            if off_log_prob.numel() > 0 and off_response_mask.sum().item() > 0:
+                sft_loss = VF.masked_mean(-off_log_prob, off_response_mask)
+
+        on_policy_mask = ~off_policy_mask
+        if on_policy_mask.any():
+            on_policy_log_prob = log_prob[on_policy_mask]
+            on_policy_old_log_prob = old_log_prob[on_policy_mask]
+            on_policy_adv = advantages[on_policy_mask]
+            on_policy_resp_mask = response_mask[on_policy_mask]
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_vanilla(
+                old_log_prob=on_policy_old_log_prob,
+                log_prob=on_policy_log_prob,
+                advantages=on_policy_adv,
+                response_mask=on_policy_resp_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=config,
+                rollout_log_probs=None,
+            )
+        else:
+            pg_loss = torch.tensor(0.0, device=log_prob.device)
+            pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
+            ppo_kl = torch.tensor(0.0, device=log_prob.device)
+            pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
+
+        if sft_loss is not None and not torch.isnan(sft_loss):
+            sft_coef = getattr(config, "sft_loss_coef", 1.0)
+            pg_loss = pg_loss + sft_loss * sft_coef
+
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_log_probs=rollout_log_probs,
+    )
+
+    if prefix_mask is None or prefix_mask.numel() == 0:
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+    hint_coef = getattr(config, "hpt_hint_loss_coef", getattr(config, "uft_hint_loss_coef", 0.0))
+    if hint_coef <= 0:
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+    hint_mask = prefix_mask * response_mask
+    hint_loss_mat = -log_prob
+    hint_loss = agg_loss(loss_mat=hint_loss_mat, loss_mask=hint_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = pg_loss + hint_coef * hint_loss
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss(
+    "uft",
+    extra_keys={"prefix_mask"},
+)
+def compute_policy_loss_uft(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgorithmConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+    prefix_mask: torch.Tensor | None = None,
+    metrics: dict | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """UFT policy loss: vanilla PPO + SFT loss on prefix (hint) tokens.
+    
+    UFT (Unifying SFT and RFT) adds supervised learning on hint tokens
+    while performing RL on the rest of the response.
+    
+    The SFT loss is computed on prefix tokens (marked by prefix_mask),
+    which are sampled from the golden CoT with cosine annealing schedule.
+    """
+    assert config is not None
+    assert not isinstance(config, AlgorithmConfig)
+
+    response_mask_no_hint = response_mask
+    if prefix_mask is not None:
+        # Exclude hint/prefix tokens from PPO loss (SFT-only on hint tokens)
+        response_mask_no_hint = response_mask & (~prefix_mask)
+
+    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask_no_hint,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_log_probs=rollout_log_probs,
+    )
+
+    sft_loss_coef = getattr(config, "sft_loss_coef", 0.0)
+    if sft_loss_coef > 0 and prefix_mask is not None:
+        hint_mask = prefix_mask * response_mask
+        hint_sft_loss = VF.masked_mean(-log_prob, hint_mask)
+        pg_loss = pg_loss + hint_sft_loss * sft_loss_coef
+        
+        # Log metrics
+        if metrics is not None:
+            metrics["actor/hint_sft_loss"] = hint_sft_loss.detach().item()
+            # Log hint coverage: fraction of response that is hint
+            hint_token_count = hint_mask.sum().item()
+            response_token_count = response_mask.sum().item()
+            if response_token_count > 0:
+                metrics["actor/hint_ratio"] = hint_token_count / response_token_count
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -484,3 +978,33 @@ def compute_policy_loss_geo_mean(
     pg_clipfrac_lower = VF.masked_mean((clipped * (advantages < 0)).float(), response_mask)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+def _reshape_ratio(
+    ratio: torch.Tensor,
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    reshape: str,
+    reshape_weight: float,
+    reshape_pow_exp: float,
+):
+    if reshape == "no_reshape":
+        return ratio
+    if reshape == "logp":
+        return log_prob * reshape_weight
+    if reshape == "p_logp":
+        return log_prob * reshape_weight + ratio
+    if reshape == "square_root":
+        return torch.sqrt(ratio)
+    if reshape == "p_div_p_0.1":
+        return ratio / (ratio + 0.1)
+    if reshape == "p_div_p_0.5":
+        return ratio / (ratio + 0.5)
+    if reshape == "p_div_p_0.3":
+        return ratio / (ratio + 0.3)
+    if reshape == "pow":
+        return torch.pow(ratio, reshape_pow_exp)
+    if reshape == "classic_reject_token":
+        # handled in luffy loss to use reject_coef
+        return ratio
+    raise ValueError(f"Invalid reshape: {reshape}")

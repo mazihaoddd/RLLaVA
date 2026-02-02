@@ -21,7 +21,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from torch.utils.data import RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from .dataset import RLHFDataset, RLHFDatasetWithTarget
+from .dataset import RLHFDataset
 from .data_utils import collate_fn
 from .config import DataConfig
 from rllava.utils.dist_utils import is_rank0
@@ -32,15 +32,15 @@ def create_dataloader(config: DataConfig,
                       tokenizer: PreTrainedTokenizer, 
                       processor: Optional[ProcessorMixin], 
                       dist_sampler: bool = False) -> None:
-    dataset_cls = RLHFDataset if config.target_key is None else RLHFDatasetWithTarget
-
-    dataset_kwargs = dict(
+    train_dataset = RLHFDataset(
+        data_path=config.train_files,
         tokenizer=tokenizer,
         processor=processor,
         prompt_key=config.prompt_key,
         answer_key=config.answer_key,
         image_key=config.image_key,
         video_key=config.video_key,
+        image_dir=config.train_image_dir,
         video_fps=config.video_fps,
         max_prompt_length=config.max_prompt_length,
         truncation="right",
@@ -50,24 +50,6 @@ def create_dataloader(config: DataConfig,
         filter_overlong_prompts=config.filter_overlong_prompts,
         filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
     )
-
-    if dataset_cls is RLHFDatasetWithTarget:
-        dataset_kwargs.update(
-            target_key=config.target_key,
-            max_target_length=config.max_target_length,
-            sample_target_ratio=config.sample_target_ratio,
-            target_list_key=config.target_list_key,
-            target_probs_key=config.target_probs_key,
-            max_num_targets=config.max_num_targets,
-            strip_target_think_tag=config.strip_target_think_tag,
-        )
-
-    train_dataset = dataset_cls(
-        data_path=config.train_files,
-        image_dir=config.train_image_dir,
-        **dataset_kwargs,
-    )
-
     # Sampler setup: use DistributedSampler in distributed; otherwise Random/Sequential
     if dist_sampler:
         sampler = DistributedSampler(
@@ -95,11 +77,21 @@ def create_dataloader(config: DataConfig,
         drop_last=True,
     )
 
-    dataset_kwargs.pop("target_key", None)
-    val_dataset = dataset_cls(
+    val_dataset = RLHFDataset(
         data_path=config.val_files,
+        tokenizer=tokenizer,
+        processor=processor,
+        prompt_key=config.prompt_key,
+        answer_key=config.answer_key,
+        image_key=config.image_key,
         image_dir=config.val_image_dir,
-        **dataset_kwargs,
+        max_prompt_length=config.max_prompt_length,
+        truncation="right",
+        format_prompt=config.format_prompt,
+        min_pixels=config.min_pixels,
+        max_pixels=config.max_pixels,
+        filter_overlong_prompts=config.filter_overlong_prompts,
+        filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
     )
 
     if config.val_batch_size == -1:

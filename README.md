@@ -20,6 +20,9 @@ RLLaVA is a user-friendly framework for multi-modal RL. It features an **RL-cent
   <img src="assets/arch.png" alt="RLLaVA Architecture" width="600">
 </div>
 
+## 📰 News
+*   **[2026-02-02]** 🚀 We have released implementations for a series of representative **SFT-RL Fusion Algorithms** (including SRFT, LUFFY, UFT and HPT). These methods are unified under our plugin system, demonstrating the flexibility of RLLaVA's architecture. Check out the [examples](examples/algorithms/sft-rl/README.md)!
+
 ---
   
 ## ✨ Why RLLaVA?

@@ -1,15 +1,22 @@
 import copy
 import json
+import yaml
+import math
+import random
 import os
 import shutil
 import hashlib
 import transformers
-import traceback
 import torch
 import torch.distributed as dist
+import megfile
+import os
+import random
+import megfile
+import traceback
 import rllava.utils.torch_functional as VF
-import numpy as np
 from typing import Optional, List, Any
+from qwen_vl_utils import smart_resize
 from dataclasses import dataclass
 from jinja2 import Template
 from typing import Dict,  Sequence
@@ -17,6 +24,7 @@ from PIL import Image, ImageFile
 from datasets import load_dataset, load_from_disk
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
+from .template import TemplateFactory
 from .text_preprocess import TextPreprocess
 from .image_preprocess import ImagePreprocess
 from rllava.utils.arguments import DataArguments
