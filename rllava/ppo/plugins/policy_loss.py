@@ -180,6 +180,25 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+@register_policy_loss("sft")
+def compute_policy_loss_sft(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgorithmConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Supervised token-level NLL over valid response tokens.
+    del old_log_prob, advantages, config, rollout_log_probs
+    sft_losses = -log_prob
+    sft_loss = agg_loss(loss_mat=sft_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    zero = torch.tensor(0.0, device=log_prob.device)
+    return sft_loss, zero, zero, zero
+
+
 @register_policy_loss(
     "luffy",
     extra_keys={"prefix_mask"}
@@ -460,10 +479,7 @@ def compute_policy_loss_srft(
         response_mask = response_mask * p_on_mask
         pg_losses = pg_losses * p_on_mask
 
-    if getattr(config, "loss_remove_token_mean", False):
-        pg_loss = (pg_losses * response_mask).sum() / response_mask.shape[-1]
-    else:
-        pg_loss = VF.masked_mean(pg_losses, response_mask)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     if sft_loss is not None and not torch.isnan(sft_loss):
         pg_loss = pg_loss + sft_loss
@@ -509,82 +525,70 @@ def compute_policy_loss_hpt(
     config: Optional[DictConfig | AlgorithmConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
     prefix_mask: torch.Tensor | None = None,
+    metrics: dict = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert config is not None
     assert not isinstance(config, AlgorithmConfig)
 
-    offline_loss_type = getattr(config, "offline_loss_type", "off_policy")
-    if offline_loss_type == "sft":
-        if prefix_mask is None or prefix_mask.numel() == 0:
-            return compute_policy_loss_vanilla(
-                old_log_prob=old_log_prob,
-                log_prob=log_prob,
-                advantages=advantages,
-                response_mask=response_mask,
-                loss_agg_mode=loss_agg_mode,
-                config=config,
-                rollout_log_probs=rollout_log_probs,
-            )
-
-        off_policy_mask = prefix_mask.any(-1)
-        sft_loss = None
-        if off_policy_mask.any():
-            off_log_prob = log_prob[off_policy_mask]
-            off_response_mask = response_mask[off_policy_mask]
-            if off_log_prob.numel() > 0 and off_response_mask.sum().item() > 0:
-                sft_loss = VF.masked_mean(-off_log_prob, off_response_mask)
-
-        on_policy_mask = ~off_policy_mask
-        if on_policy_mask.any():
-            on_policy_log_prob = log_prob[on_policy_mask]
-            on_policy_old_log_prob = old_log_prob[on_policy_mask]
-            on_policy_adv = advantages[on_policy_mask]
-            on_policy_resp_mask = response_mask[on_policy_mask]
-            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_vanilla(
-                old_log_prob=on_policy_old_log_prob,
-                log_prob=on_policy_log_prob,
-                advantages=on_policy_adv,
-                response_mask=on_policy_resp_mask,
-                loss_agg_mode=loss_agg_mode,
-                config=config,
-                rollout_log_probs=None,
-            )
-        else:
-            pg_loss = torch.tensor(0.0, device=log_prob.device)
-            pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
-            ppo_kl = torch.tensor(0.0, device=log_prob.device)
-            pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
-
-        if sft_loss is not None and not torch.isnan(sft_loss):
-            sft_coef = getattr(config, "sft_loss_coef", 1.0)
-            pg_loss = pg_loss + sft_loss * sft_coef
-
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
-
-    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_vanilla(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_log_probs=rollout_log_probs,
-    )
-
     if prefix_mask is None or prefix_mask.numel() == 0:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+        return compute_policy_loss_vanilla(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_log_probs=rollout_log_probs,
+        )
 
-    hint_coef = getattr(config, "hpt_hint_loss_coef", getattr(config, "uft_hint_loss_coef", 0.0))
-    if hint_coef <= 0:
-        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    off_policy_mask = prefix_mask.any(-1)
 
-    hint_mask = prefix_mask * response_mask
-    hint_loss_mat = -log_prob
-    hint_loss = agg_loss(loss_mat=hint_loss_mat, loss_mask=hint_mask, loss_agg_mode=loss_agg_mode)
-    pg_loss = pg_loss + hint_coef * hint_loss
+    sft_loss = None
+    if off_policy_mask.any():
+        off_log_prob = log_prob[off_policy_mask]
+        off_response_mask = response_mask[off_policy_mask]
+        if off_log_prob.numel() > 0 and off_response_mask.sum().item() > 0:
+            sft_loss = VF.masked_mean(-off_log_prob, off_response_mask)
+
+    on_policy_mask = ~off_policy_mask
+    if on_policy_mask.any():
+        on_policy_log_prob = log_prob[on_policy_mask]
+        on_policy_old_log_prob = old_log_prob[on_policy_mask]
+        on_policy_adv = advantages[on_policy_mask]
+        on_policy_resp_mask = response_mask[on_policy_mask]
+        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_vanilla(
+            old_log_prob=on_policy_old_log_prob,
+            log_prob=on_policy_log_prob,
+            advantages=on_policy_adv,
+            response_mask=on_policy_resp_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_log_probs=None,
+        )
+    else:
+        pg_loss = torch.tensor(0.0, device=log_prob.device)
+        pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
+        ppo_kl = torch.tensor(0.0, device=log_prob.device)
+        pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
+
+    ori_pg_loss = pg_loss
+    if sft_loss is not None and not torch.isnan(sft_loss):
+        sft_coef = getattr(config, "sft_loss_coef", 1.0)
+        pg_loss = pg_loss + sft_loss * sft_coef
+
+    if metrics is not None:
+        metrics['actor/ori_pg_loss'] = ori_pg_loss.detach().item()
+        metrics['actor/pg_loss'] = pg_loss.detach().item()
+        metrics['actor/ppo_kl'] = ppo_kl.detach().item()
+        metrics['actor/sft_coef'] = getattr(config, "sft_loss_coef", 1.0)
+        if sft_loss is not None and not torch.isnan(sft_loss):
+            metrics['actor/sft_loss'] = sft_loss.detach().item()
+        else:
+            metrics['actor/sft_loss'] = torch.tensor(0.0, device=pg_loss.device).detach().item()
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
 
 
 @register_policy_loss(
@@ -629,6 +633,7 @@ def compute_policy_loss_uft(
         rollout_log_probs=rollout_log_probs,
     )
 
+    ori_pg_loss = pg_loss
     sft_loss_coef = getattr(config, "sft_loss_coef", 0.0)
     if sft_loss_coef > 0 and prefix_mask is not None:
         hint_mask = prefix_mask * response_mask
@@ -637,7 +642,9 @@ def compute_policy_loss_uft(
         
         # Log metrics
         if metrics is not None:
-            metrics["actor/hint_sft_loss"] = hint_sft_loss.detach().item()
+            metrics['actor/ori_pg_loss'] = ori_pg_loss.detach().item()
+            metrics["actor/sft_coef"] = sft_loss_coef
+            metrics["actor/sft_loss"] = hint_sft_loss.detach().item()
             # Log hint coverage: fraction of response that is hint
             hint_token_count = hint_mask.sum().item()
             response_token_count = response_mask.sum().item()

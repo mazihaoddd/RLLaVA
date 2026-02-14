@@ -108,7 +108,6 @@ def dist_distribute_only():
 def dist_gather_then_scatter():
     """
     Gather full DataProto to all ranks, run func on global batch, then split evenly and return local shard.
-    If func returns (DataProto, metrics), metrics are reduced by mean across ranks.
     """
     def decorator(func: Callable):
         def wrapped(self, data, *args, **kwargs):
@@ -117,18 +116,11 @@ def dist_gather_then_scatter():
             # 1) Make data global (in-place)
             _dataproto_all_gather_inplace(data)
             # 2) Compute on full batch
-            result = func(self, data, *args, **kwargs)
-            if isinstance(result, tuple) and len(result) == 2:
-                new_data, metrics = result
-            else:
-                new_data, metrics = result, {}
+            new_data = func(self, data, *args, **kwargs)
             # 3) Split evenly and return local shard
             parts = _dataproto_chunk(new_data, _world_size())
             local = parts[_rank()]
-
-            if metrics != {}:
-                metrics = _reduce_metrics_mean(metrics)
-            return local, metrics
+            return local
         return wrapped
     return decorator
 
@@ -211,8 +203,6 @@ def gather_batch(batch) -> DataProto:
     if batch is None:
         return None
     world_size = dist.get_world_size()
-    if world_size <= 1:
-        return batch
     # All-gather on tensors requires identical shapes on every rank.
     # If ranks produce different batch sizes, fall back to object gather.
     local_len = torch.tensor([len(batch)], device=torch.cuda.current_device(), dtype=torch.int64)
@@ -226,7 +216,8 @@ def gather_batch(batch) -> DataProto:
         if torch.cuda.is_available():
             merged.to(torch.device("cuda", torch.cuda.current_device()))
         return merged
-    all_gather_data_proto(batch, size=world_size, group=dist.group.WORLD)
+    else:
+        all_gather_data_proto(batch, size=world_size, group=dist.group.WORLD)
     return batch
 
 def broadcast_object(

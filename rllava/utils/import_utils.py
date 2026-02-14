@@ -20,6 +20,7 @@ import importlib
 import importlib.util
 import os
 import warnings
+import sys
 from functools import cache, wraps
 from typing import Optional
 
@@ -101,10 +102,15 @@ def load_extern_type(file_path: Optional[str], type_name: Optional[str]) -> type
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Custom type file '{file_path}' not found.")
 
-        spec = importlib.util.spec_from_file_location("custom_module", file_path)
-        module = importlib.util.module_from_spec(spec)
+        file_path = os.path.abspath(file_path)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Custom type file '{file_path}' not found.")
+        module_dir = os.path.dirname(file_path)
+        module_name = os.path.splitext(os.path.basename(file_path))[0]
+        if module_dir not in sys.path:
+            sys.path.insert(0, module_dir)
         try:
-            spec.loader.exec_module(module)
+            module = importlib.import_module(module_name)
         except Exception as e:
             raise RuntimeError(f"Error loading module from '{file_path}'") from e
 

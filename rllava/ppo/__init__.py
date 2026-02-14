@@ -2,7 +2,7 @@ from .ppo import PPO
 from .config import PPOConfig, RolloutConfig
 from .role.rollout import Rollout
 from .role.reward import Reward
-from rllava.ppo.plugins import get_adv_estimator, get_policy_loss, PrefixRolloutProcessor, HPTBatchReplacer
+from rllava.ppo.plugins import get_adv_estimator, get_policy_loss, PrefixRolloutProcessor, HPTBatchRolloutProcessor
 
 
 
@@ -27,10 +27,18 @@ class PPOFactory:
         reward = Reward(config.reward, tokenizer)
 
         rollout_processor = None
-        if config.rollout.prefix_strategy != "none":
-            rollout_processor = PrefixRolloutProcessor()
+        if config.algorithm.unify_strategy != "none":
+            rollout_processor = HPTBatchRolloutProcessor(config, tokenizer)
+        elif config.algorithm.prefix_strategy != "none":
+            rollout_processor = PrefixRolloutProcessor(config, tokenizer)
 
-        rollout = Rollout(config.rollout, reward, tokenizer, processor, rollout_processor=rollout_processor)
+        rollout = Rollout(
+            config.rollout,
+            reward,
+            tokenizer,
+            processor,
+            rollout_processor=rollout_processor,
+        )
 
         # Instantiate PPO and inject components
         return PPO(
@@ -41,5 +49,4 @@ class PPOFactory:
             rollout=rollout,
             adv_estimator=adv_estimator,
             policy_loss=policy_loss,
-            experience_mixer=HPTBatchReplacer if config.algorithm.unify_strategy != "none" else None,
         )

@@ -32,17 +32,6 @@ class RolloutConfig:
     discount: float = 0.9
     tool_config_path: Optional[str] = None
     env_config_path: Optional[str] = None
-    # --- target prefix ---
-    prefix_strategy: str = "none"          # "none" | "random"
-    min_prefix_ratio: float = 0.0
-    max_prefix_ratio: float = 1.0
-    n_prefix: int = -1
-    prefix_share_across_samples: bool = False
-    # UFT hint schedule (used when prefix_strategy == "hint")
-    # NOTE: hint ratios are tied to min_prefix_ratio/max_prefix_ratio.
-    hint_steps: int = 0
-    hint_min_ratio: float = 0.0  # deprecated, kept for compatibility
-    hint_max_ratio: float = 1.0  # deprecated, kept for compatibility
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)
@@ -137,7 +126,9 @@ class ActorConfig:
     log_prob_micro_batch_size: int = 16
     """number of samples per forward pass for computing log probs"""
     max_grad_norm: float = 1.0
-    """number to clip grad norm"""
+    """clip grad norm to this value (equivalent to original's grad_clip)"""
+    skip_grad_norm: float = 80.0
+    """skip optimizer step entirely when pre-clip grad norm exceeds this threshold"""
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     """clip ratio in PPO & DAPO"""
@@ -176,7 +167,6 @@ class ActorConfig:
     on_policy_reshape_pow_exp: float = 0.5
     srft_type: str = "paper"
     hpt_hint_loss_coef: float = 0.0
-    offline_loss_type: str = "off_policy"
     sft_loss_coef: float = 1.0
 
     
@@ -230,11 +220,18 @@ class AlgorithmConfig:
     # # SFT&RFT configs
     unify_strategy: str = "none"  # "none" | "switch" | "soft"
     switch_gate: int = 0
-    switch_gate_off: int = 0
     success_reward_threshold: float = 1.0
-    off_policy_replace_num: int = 1
-    off_policy_replace_num_mid: int = 0
-    remove_sfted_data: bool = False
+    # --- target prefix ---
+    prefix_strategy: str = "none"          # "none" | "random"
+    min_prefix_ratio: float = 0.0
+    max_prefix_ratio: float = 1.0
+    n_prefix: int = -1
+    prefix_share_across_samples: bool = False
+    # UFT hint schedule (used when prefix_strategy == "hint")
+    # NOTE: hint ratios are tied to min_prefix_ratio/max_prefix_ratio.
+    hint_steps: int = 0
+    hint_min_ratio: float = 0.0  # deprecated, kept for compatibility
+    hint_max_ratio: float = 1.0  # deprecated, kept for compatibility
 
 
 @dataclass

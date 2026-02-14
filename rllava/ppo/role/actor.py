@@ -228,8 +228,8 @@ class Actor(PolicyRole):
                     )
 
                     if self.config.entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
-                        # entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode='token-mean')
+                        # entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode='token-mean')
                         micro_batch_metrics["actor/entropy_loss"] = entropy_loss.detach().item()
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff

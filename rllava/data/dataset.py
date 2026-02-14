@@ -8,7 +8,6 @@ import traceback
 import torch
 import torch.distributed as dist
 import rllava.utils.torch_functional as VF
-import numpy as np
 from typing import Optional, List, Any
 from dataclasses import dataclass
 from jinja2 import Template
@@ -52,6 +51,7 @@ class RLHFDataset(Dataset):
         max_pixels: Optional[int] = None,
         filter_overlong_prompts: bool = True,
         filter_overlong_prompts_workers: int = 16,
+        **kwargs,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -114,6 +114,8 @@ class RLHFDataset(Dataset):
         if self.image_key in example:
             # https://huggingface.co/docs/transformers/en/tasks/image_text_to_text
             content_list = []
+            if "<image>" not in prompt_str:
+                prompt_str = "<image>" + prompt_str
             for i, content in enumerate(prompt_str.split("<image>")):
                 if i != 0:
                     content_list.append({"type": "image"})
@@ -145,6 +147,8 @@ class RLHFDataset(Dataset):
                         messages, add_generation_prompt=True, tokenize=False
                     )
                     if self.image_key in doc and doc[self.image_key]:
+                        if not isinstance(doc[self.image_key], list):
+                            doc[self.image_key] = [doc[self.image_key]]
                         images = [
                             process_image(image, self.min_pixels, self.max_pixels) for image in doc[self.image_key]
                         ]
@@ -380,83 +384,26 @@ class RLHFDataset(Dataset):
         return example
 
 
-class RLHFDatasetWithTarget(RLHFDataset):
-    def __init__(
-        self,
-        *args,
-        target_key: Optional[str] = None,
-        max_target_length: int = 8192,
-        sample_target_ratio: float = 1.0,
-        target_list_key: Optional[str] = None,
-        target_probs_key: Optional[str] = None,
-        max_num_targets: int = 5,
-        strip_target_think_tag: bool = True,
-        **kwargs,
-    ):
+class SFTDataset(RLHFDataset):
+    """RLHF dataset with explicit supervised targets for SFT training."""
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.target_key = target_key
-        self.max_target_length = max_target_length
-        self.sample_target_ratio = sample_target_ratio
-        self.target_list_key = target_list_key
-        self.target_probs_key = target_probs_key
-        self.max_num_targets = max_num_targets
-        self.strip_target_think_tag = strip_target_think_tag
-
-    def _normalize_target_text(self, tgt, prompt_text: Optional[str]):
-        if tgt is None:
-            return None
-        if isinstance(tgt, list):
-            tgt = tgt[0]
-        if isinstance(tgt, dict) and "content" in tgt:
-            tgt = tgt["content"]
-        if not isinstance(tgt, str):
-            return None
-        if self.strip_target_think_tag and prompt_text and prompt_text.endswith("<think>\n") and tgt.startswith("<think>\n"):
-            tgt = tgt[len("<think>\n"):]
-        return tgt
+        if "cot_key" in kwargs:
+            self.cot_key = kwargs["cot_key"]
 
     def __getitem__(self, index):
         example = super().__getitem__(index)
-
-        if not self.target_key:
-            return example
-
-        if self.target_key not in self.dataset.features:
-            # no target field, return original example
-            example["tgt_input_ids"] = torch.zeros((self.max_target_length,), dtype=torch.long).fill_(self.tokenizer.pad_token_id)
-            return example
-
-        raw = self.dataset[index]
-        tgt = raw.get(self.target_key, None)
-
-        # sample_target_ratio
-        if not (np.random.rand() < self.sample_target_ratio):
-            tgt = None
-
-        prompt_text = None
-        if "raw_prompt_ids" in example:
-            prompt_text = self.tokenizer.decode(example["raw_prompt_ids"], skip_special_tokens=False)
-
-        tgt = self._normalize_target_text(tgt, prompt_text)
-        if tgt is None or tgt == "":
-            tgt_input_ids = torch.tensor([], dtype=torch.long)
-        else:
-            tgt_input_ids = self.tokenizer(
-                tgt, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"].reshape(-1)
-
-        # pad/truncate
-        tgt_input_ids = tgt_input_ids.reshape(1, -1)
-        if tgt_input_ids.size(-1) > self.max_target_length:
-            tgt_input_ids = tgt_input_ids[:, : self.max_target_length]
-        tgt_input_ids = VF.pad_sequence_to_length(
-            tgt_input_ids,
-            max_seq_len=self.max_target_length,
-            pad_token_id=self.tokenizer.pad_token_id,
-            left_pad=False,
-        ).squeeze(0)
-
-        example["tgt_input_ids"] = tgt_input_ids
+        eos_id = self.tokenizer.eos_token_id
+        target_text = str(example["ground_truth"])
+        if hasattr(self, "cot_key") and self.cot_key in example and example[self.cot_key] is not None:
+            cot_text = str(example[self.cot_key]).strip()
+            if cot_text:
+                target_text = f"{cot_text}\n{target_text}"
+        target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+        if eos_id is not None:
+            target_ids = target_ids + [eos_id]
+        # Keep raw targets in dataset; truncation/padding policy is owned by pipeline.
+        example["tgt_input_ids"] = target_ids
         return example
 
 

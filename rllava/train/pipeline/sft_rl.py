@@ -43,29 +43,30 @@ class RLVRPipeline(Pipeline):
 
                 test_batch = self.model.rollout.generate_one_batch(test_batch, val=True)
                 test_batch = gather_batch(test_batch)
-                if not is_rank0():
-                    continue
 
-                # evaluate using reward_function
-                reward_tensor, reward_metrics = self.model.compute_rewards(test_batch)
+                if is_rank0():
+                    # evaluate using reward_function
+                    reward_tensor, reward_metrics = self.model.compute_rewards(test_batch)
 
-                # store generations
-                input_ids = test_batch.batch["prompts"]
-                input_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                output_ids = test_batch.batch["responses"]
-                output_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-                scores = reward_tensor.sum(-1).cpu().tolist()
-                sample_inputs.extend(input_texts)
-                sample_outputs.extend(output_texts)
-                sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
-                sample_scores.extend(scores)
+                    # store generations
+                    input_ids = test_batch.batch["prompts"]
+                    input_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                    output_ids = test_batch.batch["responses"]
+                    output_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                    scores = reward_tensor.sum(-1).cpu().tolist()
+                    sample_inputs.extend(input_texts)
+                    sample_outputs.extend(output_texts)
+                    sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
+                    sample_scores.extend(scores)
 
-                reward_tensor_lst.append(reward_tensor)
-                for key, value in reward_metrics.items():
-                    reward_metrics_lst[key].extend(value)
+                    reward_tensor_lst.append(reward_tensor)
+                    for key, value in reward_metrics.items():
+                        reward_metrics_lst[key].extend(value)
 
-                for key, value in compute_length_metrics(test_batch).items():
-                    length_metrics_lst[key].append(value)
+                    for key, value in compute_length_metrics(test_batch).items():
+                        length_metrics_lst[key].append(value)
+
+                # break
 
         if is_rank0():
             self.maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
@@ -150,13 +151,19 @@ def main():
     policy_loss = get_policy_loss(getattr(config.actor.policy_loss, "loss_mode", 'vanilla'))
     # Initialize the reward model using the configuration and tokenizer
     reward = Reward(config.reward, tokenizer)
+    # Initialize rollout processor for handling specific SFT&RL strategies like HPT or LUFFY
+    rollout_processor = None
+    if config.algorithm.unify_strategy == "switch":
+        rollout_processor = HPTBatchRolloutProcessor(config, tokenizer)
+    elif config.algorithm.prefix_strategy != "none":
+        rollout_processor = PrefixRolloutProcessor(config, tokenizer)
     # Initialize the Rollout module which manages data generation and processing during training
     rollout = Rollout(
         config.rollout,
         reward,
         tokenizer,
         processor,
-        rollout_processor=None,
+        rollout_processor=rollout_processor,
     )
     # Initialize the PPO model with all components (config, tokenizer, reward, rollout, etc.)
     model = PPO(

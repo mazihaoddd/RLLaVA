@@ -25,13 +25,12 @@ from rllava.utils.logger.aggregate_logger import print_rank_0
 
 class PPO():
     
-    def __init__(self, config: PPOConfig, tokenizer, processor, reward: Reward, rollout: Rollout, adv_estimator=None, policy_loss=None, experience_mixer=None):
+    def __init__(self, config: PPOConfig, tokenizer, processor, reward: Reward, rollout: Rollout=None, adv_estimator=None, policy_loss=None):
         self.config = config
         self.train_batch_size = config.data.train_batch_size
         self.tokenizer = tokenizer
         self.processor = processor
         self._cache = {}
-        self.experience_mixer = experience_mixer
 
         if config.algorithm.use_kl_in_reward and config.algorithm.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
@@ -122,13 +121,6 @@ class PPO():
             self.ref.initialize(self.actor)
         
         self.reward.initialize()
-        if self.experience_mixer is not None:
-            self.experience_mixer = self.experience_mixer(
-                config=self.config,
-                rollout=self.rollout,
-                reward=self.reward,
-                train_dataloader=self.train_dataloader,
-            )
 
     def get_training_steps(self, train_dataloader):  
         if self.config.trainer.max_steps is not None:
@@ -175,8 +167,6 @@ class PPO():
                 else:
                     print_rank_0(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                     result = batch[: self.train_batch_size * self.rollout.n]
-                    if self.experience_mixer is not None:
-                        result = self.experience_mixer.apply(result)
                     result.meta_info["global_token_num"] = torch.sum(result.batch["attention_mask"], dim=-1).tolist()
                     result = result.chunk(dist.get_world_size())[dist.get_rank()]
                     return result
@@ -264,7 +254,8 @@ class PPO():
         advantages, returns = self.adv_estimator(data, self.config.algorithm)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        return data, adv_metrics
+        data.meta_info["adv_metrics"] = adv_metrics
+        return data
     
     def update_model(self, data: DataProto, global_steps) -> DataProto:
         self._process_multi_modal_inputs(data)

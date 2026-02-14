@@ -254,13 +254,24 @@ class FSDPAccelerator(TrainEngine):
         return FSDP.state_dict_type(model, state_type, state_cfg, optim_cfg)
 
     def optimizer_step(self, model: FSDP, optimizer: Optimizer):
-        """Perform optimizer step with Accelerator support."""
+        """Perform optimizer step with two-level gradient management.
+
+        1. clip_grad_norm_ clips gradients to ``max_grad_norm`` (default 1.0).
+        2. If the *pre-clip* grad norm exceeds ``skip_grad_norm`` (default 80.0),
+           the update is skipped entirely as a safety valve against gradient
+           explosions (mirrors the original Unify-Post-Training implementation).
+        """
         grad_norm = self.clip_grad_norm_(
                         model, self.config.max_grad_norm
                     )
-            
+
+        skip_threshold = getattr(self.config, "skip_grad_norm", 80.0)
+
         if not torch.isfinite(grad_norm):
             print("Gradient norm is not finite. Skip update.")
+            optimizer.zero_grad()
+        elif skip_threshold > 0 and grad_norm > skip_threshold:
+            print(f"Gradient norm is too large: {grad_norm} > {skip_threshold}. Skip update.")
             optimizer.zero_grad()
         else:
             optimizer.step()

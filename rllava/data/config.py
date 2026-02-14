@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 import os
 
 
@@ -28,15 +28,8 @@ class DataConfig:
     num_workers: int = 8
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
-
-    # --- off-policy target fields ---
-    target_key: Optional[str] = None          # field name in dataset for off-policy trace
-    max_target_length: int = 8192
-    sample_target_ratio: float = 1.0
-    target_list_key: Optional[str] = None     # (optional) list of targets
-    target_probs_key: Optional[str] = None    # (optional) token probs for IS
-    max_num_targets: int = 5
-    strip_target_think_tag: bool = True
+    dataset_class: Optional[str] = None
+    dataset_kwargs: Optional[Dict[str, Any]] = None
 
     def post_init(self):
 

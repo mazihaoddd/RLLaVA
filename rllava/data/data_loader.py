@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Optional, Type
+import importlib
+import os
 
 import torch
 import torch.distributed as dist
@@ -21,18 +23,46 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from torch.utils.data import RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from .dataset import RLHFDataset, RLHFDatasetWithTarget
+from .dataset import RLHFDataset
 from .data_utils import collate_fn
 from .config import DataConfig
 from rllava.utils.dist_utils import is_rank0
+from rllava.utils.import_utils import load_extern_type
 
+
+def _resolve_dataset_class(config: DataConfig) -> Type:
+    if config.dataset_class:
+        if ":" in config.dataset_class:
+            module_or_path, class_name = config.dataset_class.rsplit(":", 1)
+            if module_or_path.startswith(("pkg://", "file://")):
+                dataset_cls = load_extern_type(module_or_path, class_name)
+            elif module_or_path.endswith(".py") or module_or_path.startswith((".", "/")) or os.path.sep in module_or_path:
+                dataset_cls = load_extern_type(module_or_path, class_name)
+            else:
+                module = importlib.import_module(module_or_path)
+                dataset_cls = getattr(module, class_name)
+        elif "." in config.dataset_class:
+            module_name, class_name = config.dataset_class.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            dataset_cls = getattr(module, class_name)
+        else:
+            module = importlib.import_module("rllava.data.dataset")
+            if not hasattr(module, config.dataset_class):
+                raise ValueError(
+                    "dataset_class is set but cannot be resolved. "
+                    "Provide a fully-qualified name or use 'path:ClassName'."
+                )
+            dataset_cls = getattr(module, config.dataset_class)
+        return dataset_cls
+
+    return RLHFDataset
 
 
 def create_dataloader(config: DataConfig, 
                       tokenizer: PreTrainedTokenizer, 
                       processor: Optional[ProcessorMixin], 
                       dist_sampler: bool = False) -> None:
-    dataset_cls = RLHFDataset if config.target_key is None else RLHFDatasetWithTarget
+    dataset_cls = _resolve_dataset_class(config)
 
     dataset_kwargs = dict(
         tokenizer=tokenizer,
@@ -50,17 +80,8 @@ def create_dataloader(config: DataConfig,
         filter_overlong_prompts=config.filter_overlong_prompts,
         filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
     )
-
-    if dataset_cls is RLHFDatasetWithTarget:
-        dataset_kwargs.update(
-            target_key=config.target_key,
-            max_target_length=config.max_target_length,
-            sample_target_ratio=config.sample_target_ratio,
-            target_list_key=config.target_list_key,
-            target_probs_key=config.target_probs_key,
-            max_num_targets=config.max_num_targets,
-            strip_target_think_tag=config.strip_target_think_tag,
-        )
+    if config.dataset_kwargs:
+        dataset_kwargs.update(config.dataset_kwargs)
 
     train_dataset = dataset_cls(
         data_path=config.train_files,
@@ -95,7 +116,6 @@ def create_dataloader(config: DataConfig,
         drop_last=True,
     )
 
-    dataset_kwargs.pop("target_key", None)
     val_dataset = dataset_cls(
         data_path=config.val_files,
         image_dir=config.val_image_dir,

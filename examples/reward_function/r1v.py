@@ -27,8 +27,10 @@ def format_reward(response: str) -> float:
 def accuracy_reward(response: str, ground_truth: str) -> float:
     try:
         content_match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        gt_match = re.search(r"<answer>(.*?)</answer>", ground_truth, re.DOTALL)
+        ground_truth = gt_match.group(1).strip() if gt_match else ground_truth.strip()
         given_answer = content_match.group(1).strip() if content_match else response.strip()
-        if grade_answer(given_answer, ground_truth.strip()):
+        if grade_answer(given_answer, ground_truth):
             return 1.0
 
     except Exception:
@@ -47,4 +49,14 @@ def compute_score(reward_input: dict[str, Any], format_weight: float = 0.5) -> d
         "overall": (1 - format_weight) * accuracy_score + format_weight * format_score,
         "format": format_score,
         "accuracy": accuracy_score,
+    }
+
+
+def compute_score_without_format(reward_input: dict[str, Any]) -> dict[str, float]:
+    if not isinstance(reward_input, dict):
+        raise ValueError("Please use `reward_type=sequential` for r1v reward function.")
+
+    accuracy_score = accuracy_reward(reward_input["response"], reward_input["ground_truth"])
+    return {
+        "overall": accuracy_score,
     }
