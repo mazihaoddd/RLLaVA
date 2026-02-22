@@ -111,7 +111,7 @@ class RLHFDataset(Dataset):
             format_prompt = Template(self.format_prompt.strip())
             prompt_str = format_prompt.render(content=prompt_str)
 
-        if self.image_key in example:
+        if self.image_key in example and example[self.image_key] is not None:
             # https://huggingface.co/docs/transformers/en/tasks/image_text_to_text
             content_list = []
             if "<image>" not in prompt_str:
@@ -124,7 +124,7 @@ class RLHFDataset(Dataset):
                     content_list.append({"type": "text", "text": content})
 
             return [{"role": "user", "content": content_list}]
-        elif self.video_key in example:
+        elif self.video_key in example and example[self.video_key] is not None:
             content_list = []
             for i, content in enumerate(prompt_str.split("<video>")):
                 if i != 0:
@@ -287,18 +287,23 @@ class RLHFDataset(Dataset):
         if self.image_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             images = example.pop(self.image_key)
-            # Handle both single image and list of images #mzh
-            if not isinstance(images, list): #mzh
-                images = [images] #mzh
-            if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
-                images = [os.path.join(self.image_dir, image) for image in images]
 
-            processed_images = [] if len(images) != 0 else None  # text-only data
-            for image in images:
-                #processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
-                processed_images.append(process_image(image, self.min_pixels, self.max_pixels, self.processor))
-
-            model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
+            if images is not None:
+                # Handle both single image and list of images #mzh
+                if not isinstance(images, list): #mzh
+                    images = [images] #mzh
+                if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
+                    images = [os.path.join(self.image_dir, image) for image in images]
+    
+                processed_images = [] if len(images) != 0 else None  # text-only data
+                for image in images:
+                    #processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
+                    processed_images.append(process_image(image, self.min_pixels, self.max_pixels, self.processor))
+    
+                model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
+            else:
+                model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
+                
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
             # image_grid_thw = model_inputs.pop("image_grid_thw")[0]

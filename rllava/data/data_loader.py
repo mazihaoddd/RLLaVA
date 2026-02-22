@@ -116,6 +116,9 @@ def create_dataloader(config: DataConfig,
         drop_last=True,
     )
 
+    if 'val' in config.dataset_kwargs:
+        dataset_kwargs.update(config.dataset_kwargs['val'])
+
     val_dataset = dataset_cls(
         data_path=config.val_files,
         image_dir=config.val_image_dir,
