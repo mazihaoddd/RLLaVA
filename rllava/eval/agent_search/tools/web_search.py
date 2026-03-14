@@ -65,3 +65,56 @@ def web_search_SERPER_API(query: Optional[str], search_num=2, search_mode: str =
             result['web_content_markdown'] = web_content_markdown
             result['web_content_metadata'] = web_content_metadata
         return results
+
+def web_search_BOCHA_API(query: Optional[str], search_num=2, search_mode: str = 'fast') -> Optional[List[str]]:
+    """使用博查 Search API 进行网页搜索。"""
+    assert search_mode == 'fast' or search_mode == 'pro'
+    assert type(query) == str
+
+    api_key = os.getenv("BOCHA_API")
+    if not api_key:
+        raise ValueError("BOCHA_API environment variable is required")
+
+    url = "https://api.bochaai.com/v1/web-search"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "query": query,
+        "count": search_num,
+        "summary": True,
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    results = []
+    web_pages = data.get("webPages", {}).get("value", [])
+    for item in web_pages:
+        results.append(
+            {
+                "title": item.get("name", ""),
+                "href": item.get("url", ""),
+                "body": item.get("summary", item.get("snippet", "")),
+            }
+        )
+
+    if search_mode == 'pro':
+        firecrawl_app = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API"))
+        for result in results:
+            try:
+                web_url = result['href']
+                # firecrawl_app returns markdown and metadata
+                web_content = firecrawl_app.scrape_url(web_url)
+                web_content_markdown = web_content['markdown']
+                web_content_metadata = web_content['metadata']
+                result['web_content_markdown'] = web_content_markdown
+                result['web_content_metadata'] = web_content_metadata
+            except Exception as e:
+                print(f"警告: 无法抓取URL {web_url}: {e}")
+                result['web_content_markdown'] = ""
+                result['web_content_metadata'] = {}
+
+    return results
