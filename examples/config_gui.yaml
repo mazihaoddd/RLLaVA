@@ -1,0 +1,94 @@
+data:
+  train_files: ./examples/data/osworld_train.json
+  val_files: ./examples/data/osworld_train.json
+  prompt_key: prompt
+  answer_key: answer
+  image_key: images
+  video_key: videos
+  video_fps: 2.0
+  max_prompt_length: 512
+  max_response_length: 512
+  train_batch_size: 4 
+  val_batch_size: 128
+  format_prompt: ./examples/format_prompt/gui_agent.jinja
+  override_chat_template: null
+  shuffle: true
+  seed: 1
+  min_pixels: 3136
+  max_pixels: 1048576
+  filter_overlong_prompts: true
+
+algorithm:
+  adv_estimator: grpo
+  online_filtering: false  # dapo filter groups
+  filter_key: overall
+  filter_low: 0.01
+  filter_high: 0.99
+
+actor:
+  ppo_mini_batch_size: 4  
+  ppo_micro_batch_size: 1  
+  log_prob_micro_batch_size: 1 
+  max_grad_norm: 1.0
+  model:
+    model_path: Tongyi-MAI/MAI-UI-2B
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+    freeze_vision_tower: false
+  optim:
+    lr: 1.0e-6
+    weight_decay: 1.0e-2
+    strategy: adamw  # {adamw, adamw_bf16}
+    lr_warmup_ratio: 0.0
+  fsdp:
+    enable_cpu_offload: true
+    use_orig_params: false
+    offload_params: true  # true: more CPU memory; false: more GPU memory
+    offload_optimizer: true  # true: more CPU memory; false: more GPU memory
+rollout:
+  n: 3
+  temperature: 1.0
+  top_p: 1.0
+  limit_images: 0
+  tensor_parallel_size: 1
+  disable_tqdm: false
+  vllm:
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.6
+    enforce_eager: true
+    enable_chunked_prefill: true
+  val_override_config:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    n: 1
+  max_turns: 5
+  tool_config_path: null
+  env_config_path: ./rllava/ppo/env/osworld_subprocess.yaml
+  trajectory_dir: null
+critic: null
+
+reward:
+  reward_type: env
+  reward_function: null
+  skip_special_tokens: true
+trainer:
+  total_epochs: 15
+  max_steps: null
+  project_name: rllava
+  experiment_name: mai_ui_2b_osworld_grpo
+  logger: ["console", "tensorboard"]
+  nnodes: 1
+  n_gpus_per_node: 8
+  max_try_make_batch: 20  # -1 means no limit
+  val_freq: 5  # -1 to disable
+  val_before_train: true
+  val_only: false
+  val_generations_to_log: 3
+  save_freq: 20  # -1 to disable
+  save_limit: 3  # -1 to disable
+  save_model_only: false
+  save_checkpoint_path: null
+  load_checkpoint_path: null
+  find_last_checkpoint: true

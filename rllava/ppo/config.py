@@ -28,10 +28,10 @@ class RolloutConfig:
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     load_format: str = "dummy"
     # multiturn
-    max_turns: int = 10
-    discount: float = 0.9
+    max_turns: int = 0
     tool_config_path: Optional[str] = None
     env_config_path: Optional[str] = None
+    trajectory_dir: Optional[str] = None
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)

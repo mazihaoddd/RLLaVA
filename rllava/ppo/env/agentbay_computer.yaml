@@ -1,0 +1,5 @@
+# AgentBay Computer Environment Configuration
+class_name: rllava.ppo.env.agentbay_computer_env.AgentBayComputerEnv
+config:
+  api_key: ${AGENTBAY_API_KEY}
+  max_steps: 30

@@ -340,6 +340,7 @@ class RLHFDataset(Dataset):
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
+            example["initial_prompt_text"] = messages[0]["content"]# for environment reset
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             # qwen-vl mrope
@@ -384,7 +385,10 @@ class RLHFDataset(Dataset):
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
-        example["ground_truth"] = example.pop(self.answer_key)
+        if self.answer_key and self.answer_key in example:
+            example["ground_truth"] = example.pop(self.answer_key)
+        else:
+            example["ground_truth"] = ""
         example["item"] = index
         return example
 

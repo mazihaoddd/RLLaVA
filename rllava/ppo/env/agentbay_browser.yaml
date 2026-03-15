@@ -1,0 +1,8 @@
+# AgentBay Browser Environment Configuration
+env:
+  class_name: rllava.ppo.env.agentbay_browser_env.AgentBayBrowserEnv
+  config:
+    api_key: ${AGENTBAY_API_KEY}
+    start_url: https://www.google.com
+    max_steps: 20
+    headless: true

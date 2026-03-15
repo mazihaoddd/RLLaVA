@@ -1,0 +1,6 @@
+# AgentBay Mobile Environment Configuration
+env:
+  class_name: rllava.ppo.env.agentbay_mobile_env.AgentBayMobileEnv
+  config:
+    api_key: ${AGENTBAY_API_KEY}
+    max_steps: 30

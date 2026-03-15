@@ -1,0 +1,27 @@
+# AgentBay Code Tool Configuration
+tools:
+  - class_name: rllava.ppo.tool.agentbay_code_tool.AgentBayCodeTool
+    config:
+      type: native
+      # AgentBay API Key - can also be set via AGENTBAY_API_KEY environment variable
+      api_key: ${AGENTBAY_API_KEY}
+      # Default programming language when not specified in code block
+      default_language: python
+    # Tool schema for the model to understand how to use this tool
+    tool_schema:
+      type: function
+      function:
+        name: code_execution
+        description: Execute code in a cloud environment. Supports Python, JavaScript, Bash, and other languages.
+        parameters:
+          type: object
+          properties:
+            language:
+              type: string
+              description: Programming language (python, javascript, bash, etc.)
+              default: python
+            code:
+              type: string
+              description: The code to execute
+          required:
+            - code

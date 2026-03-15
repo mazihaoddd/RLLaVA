@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+import asyncio
+import threading
 from ..config import RolloutConfig
 from rllava.engine import EngineFactory
 from rllava.data.protocol import DataProto
@@ -7,6 +9,7 @@ from rllava.utils.model_utils import print_gpu_memory_usage
 from typing import Callable
 from transformers import GenerationConfig
 from copy import deepcopy
+import torch.nn.functional as F
 
 
 
@@ -28,8 +31,10 @@ class Rollout():
         self.tokenizer = tokenizer
         self.processor = processor
         self.reward = reward
-        if workflow is not None:
-            self.workflow = workflow(self.reward, self.tokenizer, self.processor, self.config.max_turns, self.config.discount, self.config.tool_config_path, self.config.env_config_path)
+        self._generate_lock = threading.Lock()
+        if self.config.max_turns > 0:
+            from rllava.workflow import MultiTurnWorkflow
+            self.workflow = MultiTurnWorkflow(self.reward, self.tokenizer, self.processor, self.config.max_turns, self.config.tool_config_path, self.config.env_config_path, self.config.trajectory_dir)
         else:
             self.workflow = None
         if rollout_processor is not None:
@@ -75,8 +80,9 @@ class Rollout():
             else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-
-        output = self.rollout_engine.generate(prompts=prompts)
+        # rollout_engine is shared across samples; guard concurrent access.
+        with self._generate_lock:
+            output = self.rollout_engine.generate(prompts=prompts)
         output = output.to("cpu")
         return output
 
@@ -118,12 +124,28 @@ class Rollout():
         # DP handled by Accelerate's sharded dataloaders; generate normally on each rank's batch
             gen_batch_output = self.generate_sequences(gen_batch)
         else:
-            # MultiTurnWorkflow: process each sample individually
-            results = []
-            for i in range(len(gen_batch.batch['input_ids'])):
-                single_data = gen_batch[[i]]
-                result = self.workflow.arun_single(self, single_data)
-                results.append(result)
+            # MultiTurnWorkflow: process samples concurrently with per-sample
+            # workflow sessions to avoid shared-state races.
+            # Pass task_config to workflow if present (needed by env.reset for OSWorld/AndroidWorld)
+            if "task_config" in data.non_tensor_batch:
+                gen_batch.non_tensor_batch["task_config"] = data.non_tensor_batch["task_config"]
+                gen_batch.non_tensor_batch["initial_prompt_text"] = data.non_tensor_batch["initial_prompt_text"]
+
+            def run_one(sample: DataProto) -> DataProto:
+                session_workflow = self.workflow.create_session()
+                try:
+                    return session_workflow.run_single(self, sample)
+                finally:
+                    session_workflow.close()
+
+            async def run_all():
+                tasks = [
+                    asyncio.to_thread(run_one, gen_batch[[i]])
+                    for i in range(len(gen_batch.batch['input_ids']))
+                ]
+                return await asyncio.gather(*tasks)
+
+            results = asyncio.run(run_all())
             gen_batch_output = DataProto.concat(results)
 
         if self.rollout_processor is not None and val is False:
